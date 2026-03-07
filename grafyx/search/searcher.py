@@ -8,8 +8,7 @@ optional semantic search.
 Search pipeline overview (for CodeSearcher.search()):
 
     1. **Tokenize & weigh**: split query into tokens, compute IDF weights.
-    2. **Build context**: create file-context index (sibling symbol names),
-       module docstrings, and class docstrings for enriching function scoring.
+    2. **Build context**: class docstrings for method enrichment.
     3. **Score all symbols**: iterate all functions, classes, and files,
        scoring each against the query using _score_match().
     4. **Source token blending**: for functions with weak keyword scores,
@@ -48,7 +47,9 @@ from grafyx.graph import CodebaseGraph
 from grafyx.utils import split_tokens
 
 from grafyx.search._embeddings import EmbeddingSearcher
+from grafyx.search._gibberish import is_gibberish
 from grafyx.search._merge import _merge_results
+from grafyx.search._relevance import ml_score_match
 from grafyx.search._scoring import ScoringMixin
 from grafyx.search._source_index import SourceIndexMixin
 from grafyx.search._tokens import (
@@ -182,69 +183,16 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
         # --- Build IDF weights ---
         token_weights = self._compute_idf_weights(query_tokens, all_functions, all_classes)
 
-        # --- Build file context index ---
-        # File context = symbol NAMES only.  No docstrings -- they're too
-        # verbose in aggregate and cause false positives when a 20-function
-        # file's combined docs randomly match query words.
-        # Class docstrings are given directly to each class's methods via
-        # the class_docstrings lookup below, not sprayed across all functions.
-        file_context: dict[str, str] = {}  # path -> concatenated symbol names
-        file_docstrings: dict[str, str] = {}  # path -> module docstring
-        class_docstrings: dict[str, str] = {}  # class_name -> class docstring
-
-        # Collect module docstrings from file objects
-        for file_dict in all_files:
-            path = file_dict.get("path", "")
-            if not path:
-                continue
-            path_norm = path.replace("\\", "/").rstrip("/")
-            suffix = self._path_suffix(path_norm)
-            doc = file_dict.get("docstring", "")
-            if doc:
-                # Store under both full path and suffix for robust lookup
-                file_docstrings[path_norm] = doc
-                file_docstrings[suffix] = doc
-
-        # Build class docstring index (for method enrichment).
+        # --- Build class docstring index (for method enrichment) ---
         # When scoring a method like UserService.authenticate(), the class
         # docstring ("Service for user management") provides conceptual
         # context that helps match queries like "user management".
+        class_docstrings: dict[str, str] = {}  # class_name -> class docstring
         for cls_dict in all_classes:
             cls_name = cls_dict.get("name", "")
             doc = cls_dict.get("docstring", "")
             if cls_name and doc:
                 class_docstrings[cls_name] = doc
-
-        # Function names only (no docstrings -- see rationale above)
-        for func_dict in all_functions:
-            fpath = func_dict.get("file", "").replace("\\", "/").rstrip("/")
-            if not fpath:
-                continue
-            name = func_dict.get("name", "")
-            file_context[fpath] = file_context.get(fpath, "") + f" {name}"
-            suffix = self._path_suffix(fpath)
-            file_context[suffix] = file_context.get(suffix, "") + f" {name}"
-
-        # Class names only (docstrings go to class_docstrings, not file context)
-        for cls_dict in all_classes:
-            cpath = cls_dict.get("file", "").replace("\\", "/").rstrip("/")
-            if not cpath:
-                continue
-            name = cls_dict.get("name", "")
-            file_context[cpath] = file_context.get(cpath, "") + f" {name}"
-            suffix = self._path_suffix(cpath)
-            file_context[suffix] = file_context.get(suffix, "") + f" {name}"
-
-        def _get_file_context(fpath: str) -> str:
-            """Look up file context (sibling names + module docstring) by path or suffix."""
-            fp = fpath.replace("\\", "/").rstrip("/")
-            ctx = file_context.get(fp, "")
-            if not ctx:
-                ctx = file_context.get(self._path_suffix(fp), "")
-            doc = file_docstrings.get(fp, "")
-            if not doc:
-                doc = file_docstrings.get(self._path_suffix(fp), "")
-            return f"{doc} {ctx}".strip()
 
         # --- Score all symbols, collecting results per kind ---
         func_results: list[SearchResult] = []
@@ -259,59 +207,26 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 # Build enriched docstring for scoring:
                 # 1. Function's own docstring
                 # 2. Parent class docstring (if method) -- targeted, not sprayed
-                # 3. File-level context (sibling names + module docstring)
                 own_doc = func_dict.get("docstring") or ""
                 cls_name = func_dict.get("class_name", "")
                 if cls_name:
                     cls_doc = class_docstrings.get(cls_name, "")
                     if cls_doc:
                         own_doc = f"{own_doc} {cls_doc}".strip()
-                fc = _get_file_context(func_file)
-                combined_doc = f"{own_doc} {fc}".strip() if fc else own_doc
-                score = self._score_match(
+                # Get source tokens for this function (if available)
+                src_tokens = self._get_source_tokens(name, func_file)
+
+                score = ml_score_match(
                     query_tokens, query_lower, name,
-                    combined_doc,
+                    own_doc,
                     func_file,
                     token_weights=token_weights,
+                    source_tokens=src_tokens,
+                    is_dunder=name.startswith("__") and name.endswith("__"),
+                    is_init_file="__init__" in func_file,
+                    is_method=bool(cls_name),
+                    is_class=False,
                 )
-                # Boost methods whose class name also matches the query.
-                # If UserService.authenticate() scores 0.5 and "UserService"
-                # itself scores 0.3, the method gets a 1.1x boost because
-                # the query is likely about that class's functionality.
-                if cls_name and score > 0.4:
-                    cls_score = self._score_match(
-                        query_tokens, query_lower, cls_name, "", "",
-                        token_weights=token_weights,
-                    )
-                    if cls_score > 0.2:
-                        score = score * 1.1
-
-                # --- Source token blending ---
-                # If function body contains query tokens (e.g., jwt.decode,
-                # StreamingResponse), boost score.  This catches functions whose
-                # names don't match but whose implementations are directly
-                # relevant.
-                src_score = self._source_score_for(
-                    name, func_file, query_tokens, token_weights,
-                )
-                if src_score > 0.15:
-                    if score < 0.65:
-                        # Weak keyword match -- source evidence can dominate.
-                        # Two blend strategies compete:
-                        # - Pure source signal: for functions where name
-                        #   is completely unrelated
-                        # - Additive blend: for functions where name
-                        #   partially matches
-                        source_boosted = max(
-                            score,
-                            src_score * 0.55,          # Pure source signal
-                            score + src_score * 0.25,  # Additive blend
-                        )
-                        score = min(0.80, source_boosted)
-                    else:
-                        # Strong keyword match -- source provides a mild
-                        # additive nudge (soft cap at 0.85 handles overflow).
-                        score = score + src_score * 0.10
 
                 # Threshold: only include results with meaningful relevance
                 if score > 0.4:
@@ -339,11 +254,15 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 # type definitions (e.g., types.py), sibling class names inflate
                 # scores for every class, making SkillExecutionResult match
                 # "permission" because SkillPermissions is a sibling.
-                score = self._score_match(
+                score = ml_score_match(
                     query_tokens, query_lower, name,
                     own_doc,
                     cls_file,
                     token_weights=token_weights,
+                    is_dunder=name.startswith("__") and name.endswith("__"),
+                    is_init_file="__init__" in cls_file,
+                    is_method=False,
+                    is_class=True,
                 )
                 if score > 0.4:
                     bases = cls_dict.get("base_classes", [])
@@ -363,11 +282,9 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             for file_dict in all_files:
                 path = file_dict.get("path", "")
                 filename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else ""
-                fc = _get_file_context(path)
-                file_doc = file_dict.get("docstring", "")
-                combined_doc = f"{file_doc} {fc}".strip()
-                score = self._score_match(query_tokens, query_lower, filename,
-                                          combined_doc, path,
+                file_doc = file_dict.get("docstring", "") or ""
+                score = ml_score_match(query_tokens, query_lower, filename,
+                                          file_doc, path,
                                           token_weights=token_weights)
                 if score > 0.35:
                     fcount = file_dict.get("function_count", 0)
@@ -661,11 +578,40 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             for r in merged[:max_results]
         ]
 
+        # --- Gibberish gate ---
+        # Two-layer defence: ML model first (character bigram patterns),
+        # then heuristic fallback (symbol name / source token matching).
+        best_score = results[0]["score"] if results else 0.0
+        if results:
+            query_is_gibberish = is_gibberish(query)
+            if query_is_gibberish:
+                # ML model says gibberish — but give the heuristic a chance
+                # to override if the query matches actual codebase symbols.
+                any_exact_name_hit = False
+                all_name_tokens: set[str] = set()
+                for fd in all_functions:
+                    all_name_tokens.update(split_tokens(fd.get("name", "")))
+                for cd in all_classes:
+                    all_name_tokens.update(split_tokens(cd.get("name", "")))
+                for qt in query_tokens:
+                    if qt in all_name_tokens:
+                        any_exact_name_hit = True
+                        break
+                    if any(self._stem_match(qt, nt) for nt in all_name_tokens):
+                        any_exact_name_hit = True
+                        break
+                if not any_exact_name_hit:
+                    source_idx = getattr(self, '_source_index', None) or {}
+                    any_source_hit = any(qt in source_idx for qt in query_tokens)
+                    if not any_source_hit:
+                        for r in results:
+                            r["score"] = min(r["score"], 0.35)
+                        best_score = results[0]["score"] if results else 0.0
+
         # --- Confidence flagging ---
         # When the best score is below 0.55, ALL results are flagged as
         # low_confidence.  This signals to the MCP client that the search
         # may not have found what the user was looking for.
-        best_score = results[0]["score"] if results else 0.0
         if results and best_score < 0.55:
             for r in results:
                 r["low_confidence"] = True
@@ -767,10 +713,12 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 continue
             name = func_dict.get("name", "")
             cls_name = func_dict.get("class_name", "")
-            score = self._score_match(
+            src_tokens = self._get_source_tokens(name, fpath)
+            score = ml_score_match(
                 query_tokens, query_lower, name,
                 func_dict.get("docstring", ""), fpath,
                 token_weights=token_weights,
+                source_tokens=src_tokens,
             )
             if score > 0.35:
                 display_name = f"{cls_name}.{name}" if cls_name else name
@@ -789,7 +737,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             if not cpath:
                 continue
             name = cls_dict.get("name", "")
-            score = self._score_match(
+            score = ml_score_match(
                 query_tokens, query_lower, name,
                 cls_dict.get("docstring", ""), cpath,
                 token_weights=token_weights,
@@ -816,7 +764,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             if not path:
                 continue
             filename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            score = self._score_match(
+            score = ml_score_match(
                 query_tokens, query_lower, filename,
                 "", path,
                 token_weights=token_weights,
@@ -929,7 +877,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     pass
             _hit_weight = sum(token_weights.get(qt, 1.0) for qt in query_tokens if qt in _combined)
             _coverage = _hit_weight / _total_q_weight
-            if _distinct >= 2 and _coverage >= 0.40:
+            if _distinct >= 2 and _coverage >= 0.30:
                 _score = _coverage * 0.70
                 # Apply inline directory bonus (same logic as the existing bonus above)
                 _parent_dir = _path_norm.rsplit("/", 1)[0].rsplit("/", 1)[-1] if "/" in _path_norm else ""

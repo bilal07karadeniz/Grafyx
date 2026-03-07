@@ -1,0 +1,37 @@
+{
+  "python": [
+    {"repo": "tiangolo/fastapi", "license": "MIT"},
+    {"repo": "pallets/flask", "license": "BSD-3"},
+    {"repo": "django/django", "license": "BSD-3"},
+    {"repo": "encode/starlette", "license": "BSD-3"},
+    {"repo": "langchain-ai/langchain", "license": "MIT"},
+    {"repo": "run-llama/llama_index", "license": "MIT"},
+    {"repo": "sqlalchemy/sqlalchemy", "license": "MIT"},
+    {"repo": "pydantic/pydantic", "license": "MIT"},
+    {"repo": "celery/celery", "license": "BSD-3"},
+    {"repo": "encode/httpx", "license": "BSD-3"},
+    {"repo": "pallets/click", "license": "BSD-3"},
+    {"repo": "tiangolo/typer", "license": "MIT"},
+    {"repo": "Textualize/rich", "license": "MIT"},
+    {"repo": "Textualize/textual", "license": "MIT"},
+    {"repo": "psf/requests", "license": "Apache-2.0"},
+    {"repo": "aio-libs/aiohttp", "license": "Apache-2.0"},
+    {"repo": "python-attrs/attrs", "license": "MIT"},
+    {"repo": "marshmallow-code/marshmallow", "license": "MIT"},
+    {"repo": "tortoise/tortoise-orm", "license": "Apache-2.0"},
+    {"repo": "tiangolo/sqlmodel", "license": "MIT"},
+    {"repo": "Dramatiq/dramatiq", "license": "LGPL-3.0"},
+    {"repo": "rq/rq", "license": "BSD-2"},
+    {"repo": "pytest-dev/pytest", "license": "MIT"},
+    {"repo": "HypothesisWorks/hypothesis", "license": "MPL-2.0"},
+    {"repo": "sanic-org/sanic", "license": "MIT"}
+  ],
+  "typescript": [
+    {"repo": "vercel/next.js", "license": "MIT"},
+    {"repo": "facebook/react", "license": "MIT"},
+    {"repo": "vuejs/core", "license": "MIT"},
+    {"repo": "sveltejs/svelte", "license": "MIT"},
+    {"repo": "trpc/trpc", "license": "MIT"},
+    {"repo": "prisma/prisma", "license": "Apache-2.0"}
+  ]
+}

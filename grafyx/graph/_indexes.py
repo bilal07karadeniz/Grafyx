@@ -65,6 +65,40 @@ from grafyx.utils import (
 
 logger = logging.getLogger(__name__)
 
+# Module-level compiled regexes for __init__.py re-export resolution.
+# Kept outside the class so MagicMock(spec=...) in tests doesn't shadow them.
+_RE_RELATIVE_IMPORT = re.compile(r"from\s+\.(\w[\w.]*)\s+import\s+(.+)")
+_RE_LAZY_DICT_ENTRY = re.compile(r'["\'](\w+)["\']\s*:\s*["\']\.(\w[\w.]*)["\']')
+
+
+def _resolve_submodule_path(
+    pkg_dir: str, submodule: str, known_files: set[str]
+) -> str | None:
+    """Resolve a relative submodule name to a file path.
+
+    Given a package directory and a submodule name (e.g., "auth" or
+    "sub.deep"), try to find the corresponding file in the known
+    file set.
+
+    Args:
+        pkg_dir: Directory of the package (e.g., "/project/pkg")
+        submodule: Dotted submodule name (e.g., "auth" or "sub.deep")
+        known_files: Set of all known file paths in the codebase
+
+    Returns:
+        Resolved file path, or None if not found.
+    """
+    sub_path = submodule.replace(".", "/")
+    # Try sibling .py file first
+    candidate_py = f"{pkg_dir}/{sub_path}.py"
+    if candidate_py in known_files:
+        return candidate_py
+    # Try sub-package __init__.py
+    candidate_init = f"{pkg_dir}/{sub_path}/__init__.py"
+    if candidate_init in known_files:
+        return candidate_init
+    return None
+
 
 class IndexBuilderMixin:
     """Builds reverse caller, import, and instance indexes from parsed codebases.
@@ -839,13 +873,11 @@ class IndexBuilderMixin:
             - ``_forward_import_index``: source_file -> [imported_files] (forward)
             - ``_file_symbol_imports``: importer -> {target -> {symbol_names}}
 
-        The forward index powers ``find_import_cycles()`` (DFS for cycles)
-        and ``get_module_dependencies()`` (edge aggregation). The reverse
+        The forward index powers downstream analysis tools. The reverse
         index powers ``get_importers()`` and Level 3 caller filtering.
         """
         index: dict[str, list[str]] = {}
         forward: dict[str, list[str]] = {}
-        top_level_forward: dict[str, list[str]] = {}
         symbol_imports: dict[str, dict[str, set[str]]] = {}
         with self._lock:
             # Phase 1: Build suffix -> full_path lookup for O(1) resolution.
@@ -901,43 +933,6 @@ class IndexBuilderMixin:
                         best_shared = shared
                         best = cand
                 return best
-
-            # Build function line ranges per file for scope detection.
-            # Used to distinguish top-level imports from function-body
-            # (lazy) imports. Lazy imports should not create module-level
-            # dependency edges.
-            file_func_ranges: dict[str, list[tuple[int, int]]] = {}
-            for _lang2, _cb2 in self._codebases.items():
-                try:
-                    for _func in _cb2.functions:
-                        _fp = self.translate_path(
-                            str(safe_get_attr(_func, "filepath", ""))
-                        ).replace("\\", "/")
-                        if not _fp:
-                            continue
-                        _start = self._extract_line(_func)
-                        _src = safe_str(safe_get_attr(_func, "source", ""))
-                        if _start and _src:
-                            _end = _start + _src.count("\n")
-                            if _fp not in file_func_ranges:
-                                file_func_ranges[_fp] = []
-                            file_func_ranges[_fp].append((_start, _end))
-                    for _cls in _cb2.classes:
-                        for _meth in safe_get_attr(_cls, "methods", []):
-                            _fp = self.translate_path(
-                                str(safe_get_attr(_meth, "filepath", ""))
-                            ).replace("\\", "/")
-                            if not _fp:
-                                continue
-                            _start = self._extract_line(_meth)
-                            _src = safe_str(safe_get_attr(_meth, "source", ""))
-                            if _start and _src:
-                                _end = _start + _src.count("\n")
-                                if _fp not in file_func_ranges:
-                                    file_func_ranges[_fp] = []
-                                file_func_ranges[_fp].append((_start, _end))
-                except Exception:
-                    continue
 
             # Phase 2: for each file, resolve imports to known files
             for lang, codebase in self._codebases.items():
@@ -1025,13 +1020,6 @@ class IndexBuilderMixin:
                                         break
 
                             if target:
-                                # Skip __init__.py importing its own sub-packages
-                                # e.g., mypackage/__init__.py -> mypackage/sub.py
-                                if fpath.endswith("/__init__.py"):
-                                    init_dir = fpath[: -len("/__init__.py")]
-                                    if target.startswith(init_dir + "/"):
-                                        continue
-
                                 if target not in index:
                                     index[target] = []
                                 if fpath not in index[target]:
@@ -1041,20 +1029,6 @@ class IndexBuilderMixin:
                                     forward[fpath] = []
                                 if target not in forward[fpath]:
                                     forward[fpath].append(target)
-                                # Track whether this import is at top-level
-                                # or inside a function body (lazy import).
-                                imp_line = self._extract_line(imp)
-                                is_top_level = True
-                                if imp_line and fpath in file_func_ranges:
-                                    for _fstart, _fend in file_func_ranges[fpath]:
-                                        if _fstart <= imp_line <= _fend:
-                                            is_top_level = False
-                                            break
-                                if is_top_level:
-                                    if fpath not in top_level_forward:
-                                        top_level_forward[fpath] = []
-                                    if target not in top_level_forward[fpath]:
-                                        top_level_forward[fpath].append(target)
                                 # Symbol-level: track which names this file imports from target
                                 sym_names = self._extract_symbol_names_from_import(imp_source)
                                 if sym_names:
@@ -1067,10 +1041,153 @@ class IndexBuilderMixin:
                     logger.error("Error building import index for %s: %s", lang, e)
             self._import_index = index
             self._forward_import_index = forward
-            self._top_level_forward_import_index = top_level_forward
             self._file_symbol_imports = symbol_imports
+            self._resolve_init_reexports()
         logger.debug("Import index built: %d reverse, %d forward, %d symbol-level entries",
-                     len(index), len(forward), len(symbol_imports))
+                     len(self._import_index), len(self._forward_import_index),
+                     len(self._file_symbol_imports))
+
+    # --- __init__.py Re-export Resolution ---
+
+    def _resolve_init_reexports(self) -> None:
+        """Resolve __init__.py re-exports to actual source modules.
+
+        When a consumer does ``from package import X`` and the package's
+        ``__init__.py`` re-exports ``X`` from a submodule (via explicit
+        relative imports or ``__getattr__`` lazy loading), this method
+        adds the actual source file to ``_import_index``,
+        ``_forward_import_index``, and ``_file_symbol_imports`` alongside
+        the existing ``__init__.py`` entries.
+
+        Three re-export patterns are recognized:
+
+        1. **Explicit relative imports**: ``from .module import X``
+        2. **``__getattr__`` lazy loading**: dict mapping symbol names
+           to relative module paths
+        3. **``__all__``**: Only useful when combined with pattern 1
+           (narrows what's exported but doesn't change source mapping)
+        """
+        # Build set of all known file paths for resolution
+        all_known_files: set[str] = set()
+        # Also collect __init__.py file objects for source inspection
+        init_file_objects: dict[str, Any] = {}  # init_path -> file object
+
+        for _lang, codebase in self._codebases.items():
+            try:
+                for f in codebase.files:
+                    fp = self.translate_path(
+                        str(safe_get_attr(f, "path", safe_get_attr(f, "filepath", "")))
+                    ).replace("\\", "/")
+                    if fp:
+                        all_known_files.add(fp)
+                        if fp.endswith("/__init__.py"):
+                            init_file_objects[fp] = f
+            except Exception:
+                continue
+
+        if not init_file_objects:
+            return
+
+        # For each __init__.py, build re-export map: symbol -> source_file_path
+        # Maps: init_path -> {symbol_name -> resolved_source_path}
+        init_reexport_map: dict[str, dict[str, str]] = {}
+
+        for init_path, file_obj in init_file_objects.items():
+            pkg_dir = init_path.rsplit("/__init__.py", 1)[0]
+            symbol_to_source: dict[str, str] = {}
+
+            # --- Pattern 1: Explicit relative imports ---
+            imports = safe_get_attr(file_obj, "imports", [])
+            for imp in imports:
+                imp_source = safe_str(safe_get_attr(imp, "source", ""))
+                if not imp_source:
+                    imp_source = safe_str(imp)
+                if not imp_source:
+                    continue
+
+                m = _RE_RELATIVE_IMPORT.match(imp_source.strip())
+                if not m:
+                    continue
+
+                submodule = m.group(1)  # e.g., "auth" or "sub.deep"
+                names_str = m.group(2)  # e.g., "X, Y, Z"
+                # Parse symbol names (handle "as" aliases)
+                symbols = set()
+                for part in names_str.split(","):
+                    part = part.strip()
+                    if not part or part.startswith("("):
+                        part = part.lstrip("(")
+                    if part.endswith(")"):
+                        part = part.rstrip(")")
+                    part = part.strip()
+                    # Handle "X as Y" — map original name X
+                    name = part.split(" as ")[0].split()[0] if part else ""
+                    if name and name.isidentifier():
+                        symbols.add(name)
+
+                # Resolve submodule to file path
+                resolved = _resolve_submodule_path(
+                    pkg_dir, submodule, all_known_files
+                )
+                if resolved:
+                    for sym in symbols:
+                        symbol_to_source[sym] = resolved
+
+            # --- Pattern 2: __getattr__ lazy loading ---
+            functions = safe_get_attr(file_obj, "functions", [])
+            for func in functions:
+                func_name = safe_str(safe_get_attr(func, "name", ""))
+                if func_name != "__getattr__":
+                    continue
+                func_source = safe_str(safe_get_attr(func, "source", ""))
+                if not func_source:
+                    continue
+                for match in _RE_LAZY_DICT_ENTRY.finditer(func_source):
+                    sym_name = match.group(1)
+                    submod = match.group(2)  # e.g., "impl" or "sub.deep"
+                    resolved = _resolve_submodule_path(
+                        pkg_dir, submod, all_known_files
+                    )
+                    if resolved:
+                        symbol_to_source[sym_name] = resolved
+
+            if symbol_to_source:
+                init_reexport_map[init_path] = symbol_to_source
+
+        if not init_reexport_map:
+            return
+
+        # Walk _file_symbol_imports: for each consumer importing from an
+        # __init__.py, check if imported symbols can be resolved to actual
+        # source files and add entries to all three indexes.
+        for importer, targets in list(self._file_symbol_imports.items()):
+            for init_path, reexport_map in init_reexport_map.items():
+                if init_path not in targets:
+                    continue
+                imported_symbols = targets[init_path]
+                for sym in imported_symbols:
+                    if sym not in reexport_map:
+                        continue
+                    source_file = reexport_map[sym]
+
+                    # Update reverse index: source_file imported by importer
+                    if source_file not in self._import_index:
+                        self._import_index[source_file] = []
+                    if importer not in self._import_index[source_file]:
+                        self._import_index[source_file].append(importer)
+
+                    # Update forward index: importer imports source_file
+                    if importer not in self._forward_import_index:
+                        self._forward_import_index[importer] = []
+                    if source_file not in self._forward_import_index[importer]:
+                        self._forward_import_index[importer].append(source_file)
+
+                    # Update symbol imports
+                    if importer not in self._file_symbol_imports:
+                        self._file_symbol_imports[importer] = {}
+                    if source_file not in self._file_symbol_imports[importer]:
+                        self._file_symbol_imports[importer][source_file] = set()
+                    self._file_symbol_imports[importer][source_file].add(sym)
 
     # --- Import Statement Parsing Helpers ---
 

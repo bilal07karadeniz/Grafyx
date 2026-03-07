@@ -377,12 +377,63 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                             language="",
                         ))
 
+            # M5 Mamba bi-encoder search (if available)
+            try:
+                from grafyx.search._code_encoder import get_code_encoder
+                code_encoder = get_code_encoder()
+                if code_encoder is not None:
+                    m5_hits = code_encoder.search(query, top_k=30)
+                    for e_name, e_file, e_score in m5_hits:
+                        key = (e_name, e_file)
+                        if key not in result_keys_src and e_score > 0.3:
+                            result_keys_src.add(key)
+                            func_results.append(SearchResult(
+                                name=e_name, kind="function", file_path=e_file,
+                                score=e_score, context=f"{e_name}  [semantic match]",
+                                language="",
+                            ))
+            except ImportError:
+                pass
+
             # Re-sort and re-merge with all engines' results
             func_results.sort(key=lambda r: r.score, reverse=True)
             merged = _merge_results(
                 func_results, class_results, file_results,
                 max_results, kind_filter,
             )
+
+        # --- M6 Cross-encoder reranking ---
+        # Rerank top-15 results using full query-code interaction for
+        # higher precision.  Blends cross-encoder score (0.6) with
+        # original score (0.4) to preserve keyword signal.
+        try:
+            from grafyx.search._cross_encoder import get_cross_encoder
+            cross_encoder = get_cross_encoder()
+            if cross_encoder is not None and merged:
+                top_for_rerank = merged[:15]
+                reranked = cross_encoder.rerank(
+                    query,
+                    [{"name": r.name, "context": r.context, "file_path": r.file_path,
+                      "kind": r.kind, "score": r.score, "language": r.language}
+                     for r in top_for_rerank]
+                )
+                # Replace scores with blended cross-encoder + original scores
+                for i, reranked_dict in enumerate(reranked):
+                    if i < len(top_for_rerank):
+                        original_score = top_for_rerank[i].score
+                        ce_score = reranked_dict.get("cross_encoder_score", original_score)
+                        blended = 0.6 * ce_score + 0.4 * original_score
+                        merged[i] = SearchResult(
+                            name=reranked_dict["name"],
+                            kind=reranked_dict["kind"],
+                            file_path=reranked_dict["file_path"],
+                            score=blended,
+                            context=reranked_dict.get("context", ""),
+                            language=reranked_dict.get("language", ""),
+                        )
+                merged.sort(key=lambda r: r.score, reverse=True)
+        except ImportError:
+            pass
 
         # --- Graph Expansion ---
         # Three sources of expansion surface related code that the user

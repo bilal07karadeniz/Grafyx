@@ -6,9 +6,17 @@ disambiguation filtering.
 
 The core problem: when multiple classes define a method with the same name
 (e.g., ``Database.execute`` and ``ToolExecutor.execute``), a naive reverse
-index lookup for "execute" returns callers of *all* execute methods. The
-4-level filtering pipeline in ``get_callers()`` progressively eliminates
-false positives:
+index lookup for "execute" returns callers of *all* execute methods.
+
+**Primary path -- ML disambiguation (M2 Caller Disambiguator)**:
+    When model weights are available (``caller_disambig_weights.npz``),
+    each candidate caller is scored by a binary MLP that predicts
+    P(caller actually calls target_class.method). Callers scoring < 0.5
+    are filtered out. Trusted entries and same-class callers bypass scoring.
+
+**Fallback path -- 4-level heuristic pipeline**:
+    When the ML model is not available, the original rule-based pipeline
+    progressively eliminates false positives:
 
     **Level 1 - Class-level**: If the caller's own class defines the same
     method name, the call is to its own class, not the target.
@@ -35,6 +43,7 @@ Writes: nothing (read-only queries)
 import logging
 from typing import Any
 
+from grafyx.ml_inference import get_model
 from grafyx.utils import split_tokens
 
 logger = logging.getLogger(__name__)
@@ -85,8 +94,8 @@ class CallerQueryMixin:
     """Query the caller index with disambiguation and resolve method ownership.
 
     This mixin is the primary interface for answering "who calls X?" queries.
-    It reads the indexes built by ``IndexBuilderMixin`` and applies the
-    4-level disambiguation pipeline described in the module docstring.
+    It reads the indexes built by ``IndexBuilderMixin`` and applies ML-based
+    or heuristic disambiguation as described in the module docstring.
 
     Reads: _caller_index, _class_method_names, _file_class_methods,
     _class_defined_in, _import_index, _lock
@@ -99,9 +108,9 @@ class CallerQueryMixin:
 
         Args:
             function_name: The name of the called function/method.
-            class_name: If provided, activate the 4-level disambiguation
-                pipeline to filter out callers that are actually calling
-                a *different* class's method with the same name.
+            class_name: If provided, activate disambiguation filtering
+                to eliminate callers that are actually calling a *different*
+                class's method with the same name.
 
         When ``class_name`` is None, returns all raw callers (no filtering).
         Internal metadata fields (prefixed with ``_``) are always stripped
@@ -110,102 +119,134 @@ class CallerQueryMixin:
               (e.g., ``"db"`` from ``self.db.query()``), or None.
             - ``has_dot_syntax``: True if the call used dot syntax.
 
-        Filtering levels (applied only when class_name is set):
+        Disambiguation (applied only when class_name is set):
+            **ML path** (when M2 weights available): Each caller is scored
+            by a 25-feature MLP; callers scoring < 0.5 are filtered out.
+
+            **Heuristic fallback** (when M2 not available):
             1. **Class-level**: caller's own class has this method -> skip.
             2. **File-level**: caller's file defines another class with it -> skip.
             3. **Import-level**: caller's file doesn't import the target class -> skip.
             4. **Attribute-level**: receiver tokens don't match class name -> skip.
 
-        Trusted entries (``_trusted=True``, from local var type analysis) bypass
-        Levels 1-3 since we already resolved the exact target class statically.
+        Trusted entries (``_trusted=True``, from local var type analysis)
+        bypass both ML scoring and heuristic Levels 1-3.
         """
         with self._lock:
             callers = list(self._caller_index.get(function_name, []))
             if not class_name or not callers:
                 return [_format_caller_output(c) for c in callers]
 
-            # Determine if this method name is ambiguous: defined in 2+ classes.
-            # Only when ambiguous do we need the expensive Level 3 (import) and
-            # Level 4 (attribute) filtering. Non-ambiguous methods (e.g., a unique
-            # "process_payment") can skip these checks entirely.
-            ambiguous = sum(
-                1 for cls_n, meths in self._class_method_names.items()
-                if function_name in meths
-            ) >= 2
-
-            allowed_files: set[str] | None = None
-            if ambiguous:
-                allowed_files = self._get_class_importer_files(class_name)
-
-            # Pre-compute class name tokens for Level 4 receiver matching.
-            # split_tokens("EpisodicMemory") -> {"episodic", "memory"} so we
-            # can check if any receiver token overlaps with the class name.
-            class_name_tokens: set[str] | None = None
-            if ambiguous and class_name:
-                class_name_tokens = set(split_tokens(class_name))
+            # --- Try ML disambiguation first (M2 Caller Disambiguator) ---
+            model = get_model("caller_disambig")
 
             filtered = []
-            for caller in callers:
-                caller_class = caller.get("class")
-                caller_file = caller.get("file", "")
+            if model is not None:
+                # ML path: score each caller with M2 binary classifier.
+                # Trusted entries and same-class callers bypass scoring.
+                from grafyx.graph._caller_features import extract_caller_features
 
-                # Same class -> always keep
-                if caller_class == class_name:
-                    filtered.append(caller)
-                    continue
-
-                # Trusted entries (from _augment_index_with_local_var_types) are
-                # type-resolved -- we already know which class the call targets.
-                # Skip import-graph filtering (Levels 1-3) for them.
-                _trusted = caller.get("_trusted", False)
-
-                # Level 1: caller's own class has this method -> skip
-                if caller_class and not _trusted:
-                    if function_name in self._class_method_names.get(caller_class, set()):
+                for caller in callers:
+                    # Same class -> always keep
+                    if caller.get("class") == class_name:
+                        filtered.append(caller)
                         continue
 
-                # Level 2: file-level fallback -- if caller's file defines
-                # ANY other class with this method, the call is likely local.
-                if caller_file and not _trusted:
-                    file_classes = self._file_class_methods.get(caller_file, {})
-                    has_local = any(
-                        function_name in meths
-                        for cls_n, meths in file_classes.items()
-                        if cls_n != class_name
+                    # Trusted entries bypass ML (already type-resolved)
+                    if caller.get("_trusted", False):
+                        filtered.append(caller)
+                        continue
+
+                    features = extract_caller_features(
+                        caller, class_name, function_name, self,
                     )
-                    if has_local:
+                    score = model.predict(features)
+                    if score >= 0.5:
+                        filtered.append(caller)
+            else:
+                # Fallback: existing 4-level heuristic disambiguation.
+
+                # Determine if this method name is ambiguous: defined in 2+ classes.
+                # Only when ambiguous do we need the expensive Level 3 (import) and
+                # Level 4 (attribute) filtering. Non-ambiguous methods (e.g., a unique
+                # "process_payment") can skip these checks entirely.
+                ambiguous = sum(
+                    1 for cls_n, meths in self._class_method_names.items()
+                    if function_name in meths
+                ) >= 2
+
+                allowed_files: set[str] | None = None
+                if ambiguous:
+                    allowed_files = self._get_class_importer_files(class_name)
+
+                # Pre-compute class name tokens for Level 4 receiver matching.
+                # split_tokens("EpisodicMemory") -> {"episodic", "memory"} so we
+                # can check if any receiver token overlaps with the class name.
+                class_name_tokens: set[str] | None = None
+                if ambiguous and class_name:
+                    class_name_tokens = set(split_tokens(class_name))
+
+                for caller in callers:
+                    caller_class = caller.get("class")
+                    caller_file = caller.get("file", "")
+
+                    # Same class -> always keep
+                    if caller_class == class_name:
+                        filtered.append(caller)
                         continue
 
-                # Level 3: import-based -- for ambiguous method names,
-                # only keep callers from files that import the target class's module.
-                if allowed_files is not None and caller_file and not _trusted:
-                    if caller_file not in allowed_files:
-                        continue
+                    # Trusted entries (from _augment_index_with_local_var_types) are
+                    # type-resolved -- we already know which class the call targets.
+                    # Skip import-graph filtering (Levels 1-3) for them.
+                    _trusted = caller.get("_trusted", False)
 
-                # Level 4: source-based attribute analysis -- when the caller's
-                # source shows it calls .method() on a receiver whose name
-                # tokens don't match the target class, filter it out.
-                # e.g., self.short_term.add() -> "short_term" doesn't match
-                # "EpisodicMemory" -> filter.
-                if class_name_tokens is not None:
-                    call_receivers = caller.get("_receivers")
-                    if call_receivers:
-                        any_match = False
-                        all_have_context = True
-                        for receiver in call_receivers:
-                            recv_tokens = set(split_tokens(receiver))
-                            recv_tokens.discard("self")
-                            if not recv_tokens:
-                                # Bare self.method() -- can't determine target
-                                all_have_context = False
-                                break
-                            if recv_tokens & class_name_tokens:
-                                any_match = True
-                                break
-                        if all_have_context and not any_match:
+                    # Level 1: caller's own class has this method -> skip
+                    if caller_class and not _trusted:
+                        if function_name in self._class_method_names.get(caller_class, set()):
                             continue
 
-                filtered.append(caller)
+                    # Level 2: file-level fallback -- if caller's file defines
+                    # ANY other class with this method, the call is likely local.
+                    if caller_file and not _trusted:
+                        file_classes = self._file_class_methods.get(caller_file, {})
+                        has_local = any(
+                            function_name in meths
+                            for cls_n, meths in file_classes.items()
+                            if cls_n != class_name
+                        )
+                        if has_local:
+                            continue
+
+                    # Level 3: import-based -- for ambiguous method names,
+                    # only keep callers from files that import the target class's module.
+                    if allowed_files is not None and caller_file and not _trusted:
+                        if caller_file not in allowed_files:
+                            continue
+
+                    # Level 4: source-based attribute analysis -- when the caller's
+                    # source shows it calls .method() on a receiver whose name
+                    # tokens don't match the target class, filter it out.
+                    # e.g., self.short_term.add() -> "short_term" doesn't match
+                    # "EpisodicMemory" -> filter.
+                    if class_name_tokens is not None:
+                        call_receivers = caller.get("_receivers")
+                        if call_receivers:
+                            any_match = False
+                            all_have_context = True
+                            for receiver in call_receivers:
+                                recv_tokens = set(split_tokens(receiver))
+                                recv_tokens.discard("self")
+                                if not recv_tokens:
+                                    # Bare self.method() -- can't determine target
+                                    all_have_context = False
+                                    break
+                                if recv_tokens & class_name_tokens:
+                                    any_match = True
+                                    break
+                            if all_have_context and not any_match:
+                                continue
+
+                    filtered.append(caller)
             return [_format_caller_output(c) for c in filtered]
 
     # --- Import-Based Allowlist for Level 3 Filtering ---

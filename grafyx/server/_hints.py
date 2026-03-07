@@ -13,7 +13,7 @@ Which tools use hints:
     - get_function_context  (suggests top callers, important callees)
 
 Which tools DO NOT use hints:
-    - get_dependency_graph, get_call_graph, get_module_dependencies
+    - get_dependency_graph, get_call_graph
       (already deep-dive -- user is navigating deliberately)
     - Quality/search tools (analysis results, not navigation)
 
@@ -35,7 +35,7 @@ Why max 3 hints:
 from typing import Any
 
 # Maximum number of hints per response
-MAX_HINTS = 3
+MAX_HINTS = 5
 
 # Directories to deprioritize when suggesting modules to explore
 _DEPRIORITIZED_DIRS = {"tests", "test", "__pycache__", "migrations", "docs", "scripts"}

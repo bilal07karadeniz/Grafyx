@@ -1,7 +1,7 @@
-"""MCP Tools for graph traversal: dependency graphs, call graphs, module deps.
+"""MCP Tools for graph traversal: dependency graphs and call graphs.
 
-This module provides three tools that let an AI assistant explore
-**relationships** between symbols and modules:
+This module provides two tools that let an AI assistant explore
+**relationships** between symbols:
 
 - **get_dependency_graph** (Tool 7) -- what a symbol depends ON and what
   depends on IT, with transitive expansion up to a configurable depth.
@@ -10,8 +10,6 @@ This module provides three tools that let an AI assistant explore
 - **get_call_graph** (Tool 9) -- recursive call tree (both outgoing calls
   and incoming callers) for a function.  Supports disambiguation and
   cross-language filtering.
-- **get_module_dependencies** (Tool 14) -- package-level dependency map
-  that aggregates file-level imports into directory-level edges.
 
 These tools are the core of "blast radius" analysis -- understanding what
 would break if a symbol or module were changed.
@@ -32,6 +30,71 @@ from grafyx.utils import (
     safe_str,
     truncate_response,
 )
+
+
+def _suggest_alternatives(graph, query: str, max_suggestions: int = 5) -> list[str]:
+    """Find symbols with names containing the query tokens."""
+    query_tokens = set(query.lower().replace(".", " ").split())
+    suggestions: list[tuple[str, int]] = []
+
+    for func in graph.get_all_functions(max_results=2000):
+        name = func.get("name", "")
+        name_lower = name.lower()
+        hits = sum(1 for t in query_tokens if t in name_lower)
+        if hits > 0:
+            file_path = func.get("file", "")
+            label = f"{name} (function in {file_path.rsplit('/', 1)[-1]})"
+            suggestions.append((label, hits))
+
+    for cls in graph.get_all_classes(max_results=1000):
+        name = cls.get("name", "")
+        name_lower = name.lower()
+        hits = sum(1 for t in query_tokens if t in name_lower)
+        if hits > 0:
+            file_path = cls.get("file", "")
+            label = f"{name} (class in {file_path.rsplit('/', 1)[-1]})"
+            suggestions.append((label, hits))
+
+    suggestions.sort(key=lambda x: -x[1])
+    return [s[0] for s in suggestions[:max_suggestions]]
+
+
+def _is_external_dependency(graph, symbol_file: str, dep_name: str, dep_file: str) -> bool:
+    """Check if a dependency is actually external (not imported from the resolved local file).
+
+    When graph-sitter resolves a dependency name to a local file, but the actual
+    import statement imports that name from an external package, the dependency
+    should be treated as external.
+
+    Strategy:
+    1. Check if the symbol's file imports this name from the dep's resolved file.
+       If yes -> it's local (correct resolution).
+    2. If the file has imports but none import this name from dep_file,
+       it's likely an external import that graph-sitter misresolved.
+    """
+    sym_imports = getattr(graph, "_file_symbol_imports", None)
+    if not isinstance(sym_imports, dict):
+        return False  # No import tracking data available
+
+    file_imports = sym_imports.get(symbol_file, {})
+
+    # If we have no symbol-level import info for this file, can't verify
+    if not file_imports:
+        return False
+
+    # Check if this file explicitly imports this name from the resolved file
+    if dep_file in file_imports:
+        imported_names = file_imports[dep_file]
+        if dep_name in imported_names:
+            return False  # Confirmed: this file imports dep_name from dep_file
+
+    # Check if this name is imported from a DIFFERENT local file
+    for target_file, names in file_imports.items():
+        if dep_name in names:
+            return False  # Imported from a different local file, not external
+
+    # Not found in any local import — likely external
+    return True
 
 
 # --- Tool 7: get_dependency_graph ---
@@ -71,7 +134,11 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
 
         symbol_result = graph.get_symbol(symbol_name)
         if symbol_result is None:
-            raise ToolError(f"Symbol '{symbol_name}' not found.")
+            suggestions = _suggest_alternatives(graph, symbol_name)
+            msg = f"Symbol '{symbol_name}' not found."
+            if suggestions:
+                msg += " Did you mean: " + ", ".join(suggestions)
+            return {"found": False, "message": msg, "suggestions": suggestions}
 
         lang, symbol, kind = symbol_result
 
@@ -132,6 +199,11 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
                 # We count them so the AI knows they exist but don't list
                 # them to avoid noise.
                 if not _is_project_file(entry["file"]):
+                    external_dep_count[0] += 1
+                    continue
+                # P1 fix: also filter deps that graph-sitter misresolved to local files
+                # when the actual import is from an external package.
+                if _is_external_dependency(graph, context["file"], d_name, entry["file"]):
                     external_dep_count[0] += 1
                     continue
                 # At depth > 1, resolve the dependency symbol and recurse
@@ -196,6 +268,37 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
                         continue
                 by_file[imp_file] = 1
 
+        # --- Source 2b: Transitive through __init__.py ---
+        # If auth_service.py is imported by auth/__init__.py, and router.py
+        # imports auth/__init__.py with the same symbol name, then router.py
+        # transitively depends on auth_service.py.
+        if symbol_file:
+            init_importers = graph.get_importers(symbol_file)
+            for init_file in init_importers:
+                init_norm = graph.resolve_path(init_file) if init_file else init_file
+                if not init_norm or not init_norm.endswith("/__init__.py"):
+                    continue
+                # Verify __init__.py actually re-exports our symbol
+                sym_imports = getattr(graph, "_file_symbol_imports", {})
+                if not isinstance(sym_imports, dict):
+                    continue
+                init_imports = sym_imports.get(init_norm, {})
+                imported_names = init_imports.get(symbol_file, set())
+                if imported_names and symbol_name not in imported_names:
+                    continue  # __init__.py doesn't re-export this symbol
+                # Find files that import this __init__.py
+                transitive_importers = graph.get_importers(init_norm)
+                for trans_file in transitive_importers:
+                    trans_norm = graph.resolve_path(trans_file) if trans_file else trans_file
+                    if not trans_norm or trans_norm == symbol_file or trans_norm in by_file:
+                        continue
+                    # Optionally verify the transitive importer imports our symbol name
+                    trans_imports = sym_imports.get(trans_norm, {})
+                    trans_names = trans_imports.get(init_norm, set())
+                    if trans_names and symbol_name not in trans_names:
+                        continue
+                    by_file[trans_norm] = 1
+
         # --- Source 3: caller index for unique class methods ---
         # For class symbols only.  Methods like "emit" that only exist on
         # EventBus are great signals -- any caller of "emit" is definitely
@@ -234,11 +337,11 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
                     normalized_by_file[key] = normalized_by_file.get(key, 0) + count
             by_file = normalized_by_file
 
-        # Sort by reference count descending, cap at 20 files
+        # Sort by reference count descending
         if by_file:
             context["depended_on_by"] = [
                 {"file": f, "count": c}
-                for f, c in sorted(by_file.items(), key=lambda x: -x[1])[:20]
+                for f, c in sorted(by_file.items(), key=lambda x: -x[1])
             ]
 
         return truncate_response(context)
@@ -270,7 +373,11 @@ def get_call_graph(
     try:
         result = graph.get_function(function_name)
         if result is None:
-            raise ToolError(f"Function '{function_name}' not found.")
+            suggestions = _suggest_alternatives(graph, function_name)
+            msg = f"Function '{function_name}' not found."
+            if suggestions:
+                msg += " Did you mean: " + ", ".join(suggestions)
+            return {"found": False, "message": msg, "suggestions": suggestions}
 
         # --- Disambiguation (same pattern as get_function_context) ---
         if isinstance(result, list):
@@ -422,33 +529,3 @@ def get_call_graph(
         raise
     except Exception as e:
         raise ToolError(f"Error in get_call_graph: {e}")
-
-
-# --- Tool 14: get_module_dependencies ---
-
-
-@mcp.tool
-def get_module_dependencies(module_path: str = "", depth: int = 1, debug: bool = False) -> dict:
-    """Show how directories/packages depend on each other at the module level.
-
-    Aggregates file-level imports into package-level dependencies. Use this
-    to understand which packages would be affected by refactoring a module.
-
-    Args:
-        module_path: Optional filter to show only edges involving this module.
-        depth: Subdirectory grouping depth (1 = top-level directories).
-        debug: If True, include debug_file_edges showing the specific file-to-file
-            imports that contribute to each module-level edge. Use this to diagnose
-            unexpected or false edges (e.g., suspected misresolved imports).
-    """
-    graph = _ensure_initialized()
-    try:
-        # The heavy lifting is done by CodebaseGraph.get_module_dependencies(),
-        # which walks the _forward_import_index and groups edges by directory
-        # at the requested depth level.
-        result = graph.get_module_dependencies(module_path, depth, debug)
-        return truncate_response(result)
-    except ToolError:
-        raise
-    except Exception as e:
-        raise ToolError(f"Error in get_module_dependencies: {e}")

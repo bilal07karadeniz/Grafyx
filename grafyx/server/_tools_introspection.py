@@ -61,7 +61,7 @@ def get_function_context(function_name: str, detail: str = "summary", include_hi
     try:
         result = graph.get_function(function_name)
         if result is None:
-            raise ToolError(f"Function '{function_name}' not found in the codebase.")
+            return {"found": False, "message": f"Function '{function_name}' not found in the codebase."}
 
         # --- Disambiguation ---
         # graph.get_function() returns a list of (lang, func, cls_name) tuples
@@ -225,7 +225,7 @@ def get_file_context(file_path: str, detail: str = "summary", include_hints: boo
     try:
         result = graph.get_file(file_path)
         if result is None:
-            raise ToolError(f"File '{file_path}' not found in the codebase.")
+            return {"found": False, "message": f"File '{file_path}' not found in the codebase."}
 
         lang, file_obj = result
         summary = format_file_summary(file_obj)
@@ -324,13 +324,13 @@ def get_file_context(file_path: str, detail: str = "summary", include_hints: boo
 
         # --- Reverse imports: who depends on this file ---
         # graph.get_importers() returns files that import this file.
-        # Capped at 20 to avoid flooding the response.
         file_path_for_lookup = graph.translate_path(
             str(safe_get_attr(file_obj, "filepath", safe_get_attr(file_obj, "path", "")))
         )
         importers = graph.get_importers(file_path_for_lookup)
         if importers:
-            context["imported_by"] = importers[:20]
+            context["imported_by_count"] = len(importers)
+            context["imported_by"] = importers
 
         # --- Source code (always extracted, filtered by detail level) ---
         source = safe_str(safe_get_attr(file_obj, "source", "")) or None
@@ -372,7 +372,7 @@ def get_class_context(class_name: str, detail: str = "summary", include_hints: b
     try:
         result = graph.get_class(class_name)
         if result is None:
-            raise ToolError(f"Class '{class_name}' not found in the codebase.")
+            return {"found": False, "message": f"Class '{class_name}' not found in the codebase."}
 
         # Handle both single-result and multi-result forms.
         # When multiple classes share a name, we take the first match.
@@ -478,12 +478,13 @@ def get_class_context(class_name: str, detail: str = "summary", include_hints: b
                 if len(cross_file_by_path[u_file]) < 3:  # Max 3 lines per file
                     cross_file_by_path[u_file].append(u_line)
             context["internal_usage_count"] = internal_count
-            # Cap at 20 files to avoid flooding the response
-            for u_file, lines in list(cross_file_by_path.items())[:20]:
-                context["cross_file_usages"].append({
-                    "file": u_file,
-                    "lines": [l for l in lines if l is not None],
-                })
+            for u_file, lines in list(cross_file_by_path.items()):
+                filtered_lines = [l for l in lines if l is not None]
+                if filtered_lines:
+                    context["cross_file_usages"].append({
+                        "file": u_file,
+                        "lines": filtered_lines,
+                    })
 
         # --- Strategy 2: import index fallback ---
         # Use the import index to find files that import this class's module.

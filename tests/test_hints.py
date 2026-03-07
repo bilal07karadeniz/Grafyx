@@ -151,8 +151,10 @@ class TestComputeHints:
         hints = compute_hints(graph, "function", {"name": "foo"})
         assert hints == []
 
-    def test_max_three_hints(self):
-        """Never return more than 3 hints regardless of available data."""
+    def test_max_hints_respected(self):
+        """Never return more than MAX_HINTS hints regardless of available data."""
+        from grafyx.server._hints import MAX_HINTS
+
         graph = self._make_mock_graph()
         symbol_data = {
             "name": "process_order",
@@ -162,7 +164,7 @@ class TestComputeHints:
             "called_by": [{"name": f"caller_{i}", "file": f"call_{i}.py"} for i in range(20)],
         }
         hints = compute_hints(graph, "function", symbol_data)
-        assert len(hints) <= 3
+        assert len(hints) <= MAX_HINTS
 
     def test_unknown_context_type_returns_empty(self):
         """Unknown context types should return empty list, not crash."""

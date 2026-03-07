@@ -37,8 +37,151 @@ from typing import Any
 # Maximum number of hints per response
 MAX_HINTS = 5
 
+# Number of features for M4 symbol importance model
+IMPORTANCE_FEATURE_COUNT = 18
+
 # Directories to deprioritize when suggesting modules to explore
 _DEPRIORITIZED_DIRS = {"tests", "test", "__pycache__", "migrations", "docs", "scripts"}
+
+# Test directory names for feature extraction
+_TEST_DIRS = frozenset({"test", "tests", "load_tests", "__tests__", "spec", "specs"})
+
+
+def _extract_importance_features(
+    symbol_name: str,
+    symbol_file: str,
+    symbol_type: str,
+    graph: Any,
+) -> "np.ndarray":
+    """Extract 18 features for symbol importance prediction (M4).
+
+    Features capture structural signals that indicate how "important" a symbol
+    is within the codebase: caller count, cross-file usage, API indicators,
+    class size, etc.
+
+    Feature vector:
+        [0]  caller_count (normalized by /20)
+        [1]  cross_file_caller_count (unique files, normalized by /10)
+        [2]  is_exported_in___all__ (placeholder, always 0)
+        [3]  is_api_endpoint (file path contains API indicators)
+        [4]  is_entry_point (name contains "main")
+        [5]  loc_count (placeholder, always 0)
+        [6]  param_count (placeholder, always 0)
+        [7]  has_docstring (placeholder, always 0)
+        [8]  docstring_length (placeholder, always 0)
+        [9]  import_count (files importing this file, normalized by /20)
+        [10] is_base_class (placeholder, always 0)
+        [11] subclass_count (placeholder, always 0)
+        [12] method_count (for classes, normalized by /20)
+        [13] is_abstract (placeholder, always 0)
+        [14] decorator_count (placeholder, always 0)
+        [15] is_test_function (test file or test_ prefix)
+        [16] file_depth (normalized by /8)
+        [17] name_length (normalized by /30)
+
+    Args:
+        symbol_name: Name of the symbol.
+        symbol_file: File path where the symbol is defined.
+        symbol_type: One of "function", "class", "file".
+        graph: CodebaseGraph instance (for accessing indexes).
+
+    Returns:
+        numpy float32 array of shape (IMPORTANCE_FEATURE_COUNT,).
+    """
+    import numpy as np
+
+    vec = np.zeros(IMPORTANCE_FEATURE_COUNT, dtype=np.float32)
+
+    # Feature 0: caller_count (normalized)
+    callers = getattr(graph, "_caller_index", {}).get(symbol_name, [])
+    vec[0] = min(len(callers) / 20.0, 1.0)
+
+    # Feature 1: cross_file_caller_count (normalized)
+    unique_files = {c.get("file", "") for c in callers}
+    vec[1] = min(len(unique_files) / 10.0, 1.0)
+
+    # Feature 2: is_exported_in___all__ -- not easily checkable, placeholder
+    vec[2] = 0.0
+
+    # Feature 3: is_api_endpoint (file path contains API indicators)
+    api_indicators = {"router", "app", "api", "endpoint", "route", "view"}
+    file_lower = symbol_file.lower() if symbol_file else ""
+    vec[3] = float(any(ind in file_lower for ind in api_indicators))
+
+    # Feature 4: is_entry_point
+    vec[4] = float("main" in symbol_name.lower() or "__main__" in file_lower)
+
+    # Features 5-8: placeholders (not available from indexes)
+    # vec[5] = loc_count, vec[6] = param_count
+    # vec[7] = has_docstring, vec[8] = docstring_length
+
+    # Feature 9: import_count (files that import this file)
+    importers = getattr(graph, "_import_index", {}).get(symbol_file, [])
+    vec[9] = min(len(importers) / 20.0, 1.0)
+
+    # Features 10-11: base class / subclass (placeholders)
+
+    # Feature 12: method_count (for classes)
+    methods = getattr(graph, "_class_method_names", {}).get(symbol_name, set())
+    vec[12] = min(len(methods) / 20.0, 1.0)
+
+    # Features 13-14: is_abstract, decorator_count (placeholders)
+
+    # Feature 15: is_test_function
+    path_parts = (
+        symbol_file.replace("\\", "/").lower().split("/") if symbol_file else []
+    )
+    vec[15] = float(
+        any(p in _TEST_DIRS or p.startswith("test_") for p in path_parts)
+        or symbol_name.startswith("test_")
+    )
+
+    # Feature 16: file_depth (normalized)
+    vec[16] = min(len(path_parts) / 8.0, 1.0)
+
+    # Feature 17: name_length (normalized)
+    vec[17] = min(len(symbol_name) / 30.0, 1.0)
+
+    return vec
+
+
+def _score_symbol_importance(
+    symbol_name: str,
+    symbol_file: str,
+    symbol_type: str,
+    graph: Any,
+) -> float:
+    """Score symbol importance using M4 model with heuristic fallback.
+
+    When M4 model weights are available, extracts features and runs the
+    MLP predictor. Otherwise falls back to a simple count-based heuristic
+    using caller count + import count.
+
+    Args:
+        symbol_name: Name of the symbol.
+        symbol_file: File path where the symbol is defined.
+        symbol_type: One of "function", "class", "file".
+        graph: CodebaseGraph instance.
+
+    Returns:
+        Importance score in [0.0, 1.0].
+    """
+    try:
+        from grafyx.ml_inference import get_model
+        model = get_model("symbol_importance")
+    except Exception:
+        model = None
+
+    if model is not None:
+        features = _extract_importance_features(
+            symbol_name, symbol_file, symbol_type, graph,
+        )
+        return model.predict(features)
+
+    # Fallback: count-based heuristic
+    caller_count = len(getattr(graph, "_caller_index", {}).get(symbol_name, []))
+    import_count = len(getattr(graph, "_import_index", {}).get(symbol_file, []))
+    return min((caller_count + import_count) / 50.0, 1.0)
 
 
 def compute_hints(graph: Any, context_type: str, symbol_data: dict) -> list[dict]:

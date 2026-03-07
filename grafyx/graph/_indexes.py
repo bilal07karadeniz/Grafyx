@@ -847,6 +847,9 @@ class IndexBuilderMixin:
             call_receivers = receivers_by_method.get(callee_name)
             if call_receivers:
                 entry["_receivers"] = call_receivers
+            # Always set _has_dot_syntax: True when the callee was invoked
+            # via dot syntax (e.g., db.refresh()), False for standalone calls.
+            entry["_has_dot_syntax"] = bool(call_receivers)
             # Avoid duplicate entries (same caller name + file)
             if not any(
                 e["name"] == caller_name and e["file"] == caller_file

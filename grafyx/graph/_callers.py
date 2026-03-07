@@ -40,6 +40,47 @@ from grafyx.utils import split_tokens
 logger = logging.getLogger(__name__)
 
 
+def _extract_immediate_receiver(receivers: set[str] | None) -> str | None:
+    """Extract the most informative receiver token from a set of receiver expressions.
+
+    For 'self.db' -> 'db'
+    For 'self.episodic' -> 'episodic'
+    For bare 'self' -> None
+    For 'response' -> 'response'
+    For None/empty -> None
+    """
+    if not receivers:
+        return None
+    best = None
+    best_depth = -1
+    for recv in receivers:
+        parts = recv.split(".")
+        # Remove 'self' prefix
+        if parts and parts[0] == "self":
+            parts = parts[1:]
+        if not parts:
+            continue
+        # The immediate receiver is the first part after self
+        token = parts[0]
+        depth = len(parts)
+        if depth > best_depth:
+            best = token
+            best_depth = depth
+    return best
+
+
+def _format_caller_output(caller: dict) -> dict:
+    """Format a caller entry for public output.
+
+    Strips internal ``_``-prefixed keys and exposes ``receiver_token``
+    and ``has_dot_syntax`` as public fields.
+    """
+    out = {k: v for k, v in caller.items() if not k.startswith("_")}
+    out["receiver_token"] = _extract_immediate_receiver(caller.get("_receivers"))
+    out["has_dot_syntax"] = caller.get("_has_dot_syntax", False)
+    return out
+
+
 class CallerQueryMixin:
     """Query the caller index with disambiguation and resolve method ownership.
 
@@ -64,7 +105,10 @@ class CallerQueryMixin:
 
         When ``class_name`` is None, returns all raw callers (no filtering).
         Internal metadata fields (prefixed with ``_``) are always stripped
-        from the returned dicts.
+        from the returned dicts. Two derived fields are added:
+            - ``receiver_token``: the immediate receiver variable name
+              (e.g., ``"db"`` from ``self.db.query()``), or None.
+            - ``has_dot_syntax``: True if the call used dot syntax.
 
         Filtering levels (applied only when class_name is set):
             1. **Class-level**: caller's own class has this method -> skip.
@@ -78,8 +122,7 @@ class CallerQueryMixin:
         with self._lock:
             callers = list(self._caller_index.get(function_name, []))
             if not class_name or not callers:
-                # Strip internal metadata (_receivers) before returning
-                return [{k: v for k, v in c.items() if not k.startswith("_")} for c in callers]
+                return [_format_caller_output(c) for c in callers]
 
             # Determine if this method name is ambiguous: defined in 2+ classes.
             # Only when ambiguous do we need the expensive Level 3 (import) and
@@ -163,8 +206,7 @@ class CallerQueryMixin:
                             continue
 
                 filtered.append(caller)
-            # Strip internal metadata (_receivers) before returning
-            return [{k: v for k, v in c.items() if not k.startswith("_")} for c in filtered]
+            return [_format_caller_output(c) for c in filtered]
 
     # --- Import-Based Allowlist for Level 3 Filtering ---
 

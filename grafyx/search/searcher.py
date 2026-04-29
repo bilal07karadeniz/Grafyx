@@ -42,6 +42,7 @@ Search pipeline overview (for CodeSearcher.search_files()):
 from __future__ import annotations
 
 import logging
+import math
 
 from grafyx.graph import CodebaseGraph
 from grafyx.utils import split_tokens
@@ -61,6 +62,11 @@ from grafyx.search._tokens import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _log2_1p(x: float) -> float:
+    """Compute log2(1 + x) without importing math in the hot loop."""
+    return math.log2(1 + x)
 
 
 class CodeSearcher(ScoringMixin, SourceIndexMixin):
@@ -194,6 +200,9 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             if cls_name and doc:
                 class_docstrings[cls_name] = doc
 
+        # --- Caller index for graph-boosted scoring ---
+        caller_index = getattr(self._graph, "_caller_index", {})
+
         # --- Score all symbols, collecting results per kind ---
         func_results: list[SearchResult] = []
         class_results: list[SearchResult] = []
@@ -228,8 +237,15 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     is_class=False,
                 )
 
+                # Graph-boosted scoring: caller count bonus
+                # Functions called by many others are structurally important
+                caller_count = len(caller_index.get(name, []))
+                if caller_count > 0 and score > 0.15:
+                    caller_bonus = min(0.12, 0.02 * _log2_1p(caller_count))
+                    score = min(score + caller_bonus, 1.0)
+
                 # Threshold: only include results with meaningful relevance
-                if score > 0.4:
+                if score > 0.12:
                     # Add class context for methods to help the user identify them
                     context_str = func_dict.get("signature", "")
                     if cls_name:
@@ -264,7 +280,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     is_method=False,
                     is_class=True,
                 )
-                if score > 0.4:
+                if score > 0.12:
                     bases = cls_dict.get("base_classes", [])
                     base_str = ", ".join(str(b) for b in bases) if bases else ""
                     ctx = f"class {name}" + (f"({base_str})" if base_str else "")
@@ -286,7 +302,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 score = ml_score_match(query_tokens, query_lower, filename,
                                           file_doc, path,
                                           token_weights=token_weights)
-                if score > 0.35:
+                if score > 0.12:
                     fcount = file_dict.get("function_count", 0)
                     cc = file_dict.get("class_count", 0)
                     file_results.append(SearchResult(
@@ -302,9 +318,13 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     ))
 
         # --- Diversity merge ---
+        # Use a larger internal limit so augmentation engines (source, embeddings,
+        # M5) have headroom to contribute.  Final truncation to max_results
+        # happens at the end.
+        internal_limit = max(max_results * 3, 30)
         merged = _merge_results(
             func_results, class_results, file_results,
-            max_results, kind_filter,
+            internal_limit, kind_filter,
         )
 
         # --- Dual-engine: embedding + source always-on ---
@@ -317,7 +337,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
 
             # Source token hits -- always search, not just as fallback.
             # These catch functions by implementation that keyword scoring missed.
-            source_hits = self._source_search(query_tokens, token_weights, max_results=15)
+            source_hits = self._source_search(query_tokens, token_weights, max_results=20)
             for s_name, s_file, s_cls, s_score in source_hits:
                 if (s_name, s_file) not in result_keys_src:
                     result_keys_src.add((s_name, s_file))
@@ -339,7 +359,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 # Build score map for fast lookup: (name, file) -> (score, class_name)
                 emb_map: dict[tuple[str, str], tuple[float, str]] = {}
                 for e_name, e_file, e_cls, e_score in emb_hits:
-                    if e_score > 0.25:
+                    if e_score > 0.20:
                         key = (e_name, e_file)
                         if key not in emb_map or e_score > emb_map[key][0]:
                             emb_map[key] = (e_score, e_cls)
@@ -365,7 +385,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 # 0.35 threshold because embedding-only results lack keyword
                 # corroboration and are more likely to be false positives.
                 for (e_name, e_file), (e_score, e_cls) in emb_map.items():
-                    if e_score > 0.35 and (e_name, e_file) not in result_keys_src:
+                    if e_score > 0.30 and (e_name, e_file) not in result_keys_src:
                         result_keys_src.add((e_name, e_file))
                         display = f"{e_cls}.{e_name}" if e_cls else e_name
                         func_results.append(SearchResult(
@@ -385,7 +405,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     m5_hits = code_encoder.search(query, top_k=30)
                     for e_name, e_file, e_score in m5_hits:
                         key = (e_name, e_file)
-                        if key not in result_keys_src and e_score > 0.3:
+                        if key not in result_keys_src and e_score > 0.22:
                             result_keys_src.add(key)
                             func_results.append(SearchResult(
                                 name=e_name, kind="function", file_path=e_file,
@@ -399,41 +419,8 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             func_results.sort(key=lambda r: r.score, reverse=True)
             merged = _merge_results(
                 func_results, class_results, file_results,
-                max_results, kind_filter,
+                internal_limit, kind_filter,
             )
-
-        # --- M6 Cross-encoder reranking ---
-        # Rerank top-15 results using full query-code interaction for
-        # higher precision.  Blends cross-encoder score (0.6) with
-        # original score (0.4) to preserve keyword signal.
-        try:
-            from grafyx.search._cross_encoder import get_cross_encoder
-            cross_encoder = get_cross_encoder()
-            if cross_encoder is not None and merged:
-                top_for_rerank = merged[:15]
-                reranked = cross_encoder.rerank(
-                    query,
-                    [{"name": r.name, "context": r.context, "file_path": r.file_path,
-                      "kind": r.kind, "score": r.score, "language": r.language}
-                     for r in top_for_rerank]
-                )
-                # Replace scores with blended cross-encoder + original scores
-                for i, reranked_dict in enumerate(reranked):
-                    if i < len(top_for_rerank):
-                        original_score = top_for_rerank[i].score
-                        ce_score = reranked_dict.get("cross_encoder_score", original_score)
-                        blended = 0.6 * ce_score + 0.4 * original_score
-                        merged[i] = SearchResult(
-                            name=reranked_dict["name"],
-                            kind=reranked_dict["kind"],
-                            file_path=reranked_dict["file_path"],
-                            score=blended,
-                            context=reranked_dict.get("context", ""),
-                            language=reranked_dict.get("language", ""),
-                        )
-                merged.sort(key=lambda r: r.score, reverse=True)
-        except ImportError:
-            pass
 
         # --- Graph Expansion ---
         # Three sources of expansion surface related code that the user
@@ -453,8 +440,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             # (e.g., route handlers) because they're part of the same feature.
             # Score is 0.55x the called function's score (callers are one step
             # removed from the query).
-            caller_index = getattr(self._graph, "_caller_index", {})
-            for r in merged[:8]:
+            for r in merged[:15]:
                 if r.kind != "function" or not r.file_path:
                     continue
                 callers = caller_index.get(r.name, [])
@@ -545,17 +531,21 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             # --- Source 3: Co-location ---
             # Other symbols in the same files as top results are likely part
             # of the same module/feature.  Score is 0.6x the top result's
-            # score in that file.
+            # score in that file.  Capped at 2 expansions per file to prevent
+            # a single large file from dominating all expansion slots.
             top_files = set()
             for r in merged[:5]:
                 if r.file_path and r.kind in ("function", "class"):
                     top_files.add(r.file_path)
             if top_files:
+                coloc_per_file: dict[str, int] = {}
                 for func_dict in all_functions:
                     fpath = func_dict.get("file", "")
                     fname = func_dict.get("name", "")
                     key = (fname, "function", fpath)
                     if fpath in top_files and key not in result_keys:
+                        if coloc_per_file.get(fpath, 0) >= 2:
+                            continue
                         parent_score = max(
                             (r.score for r in merged[:5] if r.file_path == fpath),
                             default=0.1,
@@ -574,6 +564,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                             language=func_dict.get("language", ""),
                         ))
                         result_keys.add(key)
+                        coloc_per_file[fpath] = coloc_per_file.get(fpath, 0) + 1
 
             # --- Source 4: Directory affinity ---
             # Files in the same directory as top results are likely part of
@@ -771,7 +762,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 token_weights=token_weights,
                 source_tokens=src_tokens,
             )
-            if score > 0.35:
+            if score > 0.15:
                 display_name = f"{cls_name}.{name}" if cls_name else name
                 fpath_norm = _resolve_path(fpath)
                 if fpath_norm not in file_symbols:
@@ -793,7 +784,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 cls_dict.get("docstring", ""), cpath,
                 token_weights=token_weights,
             )
-            if score > 0.35:
+            if score > 0.15:
                 cpath_norm = _resolve_path(cpath)
                 if cpath_norm not in file_symbols:
                     file_symbols[cpath_norm] = []
@@ -820,7 +811,7 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 "", path,
                 token_weights=token_weights,
             )
-            if score > 0.35:
+            if score > 0.12:
                 path_norm = path.replace("\\", "/")
                 file_name_scores[path_norm] = score
                 file_languages[path_norm] = file_dict.get("language", "")
@@ -1038,6 +1029,24 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                 file_ranks[_i] = (_fp, _sc * 0.72, _sy)
 
         file_ranks.sort(key=lambda x: x[1], reverse=True)
+
+        # --- Per-directory diversity cap ---
+        # Prevent a single directory from dominating all results.
+        # Max 2 files per directory in the final output; remaining
+        # slots go to files from other directories for better coverage.
+        dir_counts: dict[str, int] = {}
+        diverse_ranks: list[tuple[str, float, list[dict]]] = []
+        overflow: list[tuple[str, float, list[dict]]] = []
+        for entry in file_ranks:
+            fpath_norm = entry[0].replace("\\", "/")
+            parent = fpath_norm.rsplit("/", 1)[0] if "/" in fpath_norm else ""
+            count = dir_counts.get(parent, 0)
+            if count < 2:
+                diverse_ranks.append(entry)
+                dir_counts[parent] = count + 1
+            else:
+                overflow.append(entry)
+        file_ranks = diverse_ranks + overflow
 
         # --- Format output ---
         results = []

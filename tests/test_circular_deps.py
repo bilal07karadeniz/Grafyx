@@ -203,8 +203,13 @@ class TestInitPySelfImport:
         graph._extract_symbol_names_from_import = CodebaseGraph._extract_symbol_names_from_import
         return graph
 
-    def test_init_py_importing_submodule_skipped(self):
-        """mypackage/__init__.py importing from mypackage.sub should not create a cycle edge."""
+    def test_init_py_importing_submodule_recorded(self):
+        """mypackage/__init__.py importing from mypackage.sub should be recorded.
+
+        This is needed so that transitive dependencies through __init__.py
+        re-exports can be resolved (e.g., router.py -> auth/__init__.py ->
+        auth/auth_service.py).
+        """
         graph = self._make_graph()
 
         init_file = MagicMock()
@@ -225,10 +230,10 @@ class TestInitPySelfImport:
         graph._codebases = {"python": py_codebase}
         graph._build_import_index()
 
-        # __init__.py should NOT be listed as importer of sub.py (self-import)
+        # __init__.py SHOULD be listed as importer of sub.py (for re-export tracking)
         init_path = "/project/mypackage/__init__.py"
         sub_path = "/project/mypackage/sub.py"
-        assert init_path not in graph._import_index.get(sub_path, [])
+        assert init_path in graph._import_index.get(sub_path, [])
 
     def test_external_import_of_submodule_still_works(self):
         """A file outside the package importing the sub-module should still resolve."""

@@ -30,8 +30,8 @@ class CodeTokenizer:
         vocab_path = _MODEL_DIR / "bpe_vocab.json"
         if not merges_path.exists() or not vocab_path.exists():
             raise FileNotFoundError("BPE tokenizer files not found")
-        self._merges = [tuple(m) for m in json.loads(merges_path.read_text())]
-        self._vocab = json.loads(vocab_path.read_text())
+        self._merges = [tuple(m) for m in json.loads(merges_path.read_text(encoding="utf-8"))]
+        self._vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
         self._id_to_token = {v: k for k, v in self._vocab.items()}
         self._loaded = True
 

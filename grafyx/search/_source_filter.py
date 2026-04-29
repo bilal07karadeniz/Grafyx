@@ -189,7 +189,7 @@ def filter_source_tokens(
         Dict mapping each query token to its relevance weight in [0, 1].
         When M3 model is not available, all source-present tokens get 1.0.
     """
-    model = get_model("source_filter")
+    model = get_model("source_token_filter")
     if model is None:
         # Fallback: all tokens equally weighted (no filtering)
         return {t: 1.0 for t in query_tokens}

@@ -106,7 +106,7 @@ def extract_features(
     caller_imports: list[str],
     arg_count: int,
     has_dot_syntax: bool,
-    caller_loc: int = 0,
+    caller_loc: int,
     # Candidate callee info
     callee_name: str,
     callee_class_name: str,

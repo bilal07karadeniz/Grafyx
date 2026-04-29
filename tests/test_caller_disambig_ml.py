@@ -380,15 +380,17 @@ class TestCallerDisambiguationFallback:
         names = [r["name"] for r in result]
         assert "importer_func" in names
 
-    def test_no_class_name_returns_all(self):
-        """Without class_name, all callers returned unfiltered."""
+    def test_no_class_name_filters_dot_syntax_collision(self):
+        """Without class_name, dot-syntax callers for names that collide
+        with class methods are filtered out (Bug 1 fix)."""
         graph = self._make_graph_for_callers()
 
         with patch("grafyx.graph._callers.get_model", return_value=None):
             result = graph.get_callers("refresh")
 
-        assert len(result) == 1
-        assert result[0]["name"] == "handler"
+        # "refresh" exists as a class method, and the caller uses dot syntax
+        # (db.refresh()), so it's filtered out as a likely method call.
+        assert len(result) == 0
 
 
 class TestCallerDisambiguationML:

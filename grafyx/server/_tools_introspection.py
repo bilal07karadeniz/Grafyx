@@ -252,6 +252,21 @@ def get_file_context(file_path: str, detail: str = "summary", include_hints: boo
                     "docstring": safe_str(safe_get_attr(f, "docstring", "")) or None,
                 })
 
+        # --- Object literal methods (TS/JS arrow functions) ---
+        file_path_for_olm = graph.translate_path(
+            str(safe_get_attr(file_obj, "filepath", safe_get_attr(file_obj, "path", "")))
+        )
+        for olm in getattr(graph, "_object_literal_methods", []):
+            if olm["file"] == file_path_for_olm:
+                context["functions"].append({
+                    "name": f"{olm['parent']}.{olm['name']}",
+                    "signature": f"{olm['name']}: (...) => ...",
+                    "line": olm["line"],
+                    "docstring": None,
+                })
+        # Update function count to include OLMs
+        context["function_count"] = len(context["functions"])
+
         # --- Classes defined in this file ---
         classes = safe_get_attr(file_obj, "classes", [])
         if classes:

@@ -4,7 +4,6 @@ import re
 from dataclasses import dataclass, field
 
 from grafyx.graph import CodebaseGraph
-from grafyx.utils import safe_get_attr, safe_str
 
 
 @dataclass
@@ -28,12 +27,21 @@ class ConventionDetector:
 
         Returns list of dicts: [{category, pattern, confidence, examples}]
         """
+        # Fetch function list ONCE and share across detectors.
+        # get_all_functions(include_methods=True) is expensive on large
+        # codebases (iterates all graph-sitter objects under lock).
+        # With caching (single call), 3000 is safe — covers both Python
+        # and TS/JS without one language starving the other.
+        all_functions = self._graph.get_all_functions(
+            max_results=3000, include_methods=True,
+        )
+
         conventions: list[Convention] = []
-        conventions.extend(self.detect_naming_conventions())
+        conventions.extend(self.detect_naming_conventions(all_functions))
         conventions.extend(self.detect_structure_conventions())
-        conventions.extend(self.detect_typing_conventions())
-        conventions.extend(self.detect_async_patterns())
-        conventions.extend(self.detect_docstring_conventions())
+        conventions.extend(self.detect_typing_conventions(all_functions))
+        conventions.extend(self.detect_async_patterns(all_functions))
+        conventions.extend(self.detect_docstring_conventions(all_functions))
         conventions.extend(self.detect_import_conventions())
         conventions.extend(self.detect_decorator_patterns())
 
@@ -53,79 +61,103 @@ class ConventionDetector:
     # Naming conventions
     # ------------------------------------------------------------------
 
-    def detect_naming_conventions(self) -> list[Convention]:
+    def detect_naming_conventions(
+        self, all_functions: list[dict] | None = None,
+    ) -> list[Convention]:
         """Detect naming patterns for functions, classes, and files."""
         conventions: list[Convention] = []
-        self._detect_function_naming(conventions)
+        self._detect_function_naming(conventions, all_functions)
         self._detect_class_naming(conventions)
         self._detect_file_naming(conventions)
         return conventions
 
-    def _detect_function_naming(self, out: list[Convention]) -> None:
-        functions = self._graph.get_all_functions(max_results=5000)
+    def _detect_function_naming(
+        self, out: list[Convention], all_functions: list[dict] | None = None,
+    ) -> None:
+        functions = all_functions or self._graph.get_all_functions(
+            max_results=3000, include_methods=True,
+        )
         if not functions:
             return
-        true_total = len(functions)
 
-        # Sample first 500 for pattern detection (sufficient for statistics)
-        names = [f.get("name", "") for f in functions[:500]]
-        names = [n for n in names if n]
+        # Group by language
+        by_lang: dict[str, list[dict]] = {}
+        for f in functions:
+            lang = f.get("language", "unknown")
+            by_lang.setdefault(lang, []).append(f)
 
-        # Strip leading/trailing underscores before checking style.
-        # This ensures __init__, _private_method, __repr__ are recognized as snake_case.
-        snake = [
-            n for n in names
-            if (s := n.strip("_")) and re.match(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$", s)
-        ]
-        camel = [
-            n for n in names
-            if re.match(r"^[a-z][a-zA-Z0-9]*$", n) and any(c.isupper() for c in n)
-        ]
-        total = len(names)
-        if total == 0:
-            return
+        for lang, lang_funcs in by_lang.items():
+            lang_label = lang.capitalize()
+            true_total = len(lang_funcs)
 
-        if len(snake) >= len(camel):
-            pct = len(snake) / total
-            out.append(Convention(
-                category="naming",
-                pattern=f"Functions use snake_case ({int(pct * 100)}% of {true_total} functions)",
-                confidence=pct,
-                examples=snake[:3],
-            ))
-        else:
-            pct = len(camel) / total
-            out.append(Convention(
-                category="naming",
-                pattern=f"Functions use camelCase ({int(pct * 100)}% of {true_total} functions)",
-                confidence=pct,
-                examples=camel[:3],
-            ))
+            # Sample first 500 for pattern detection (sufficient for statistics)
+            names = [f.get("name", "") for f in lang_funcs[:500]]
+            names = [n for n in names if n]
+
+            # Strip leading/trailing underscores before checking style.
+            # This ensures __init__, _private_method, __repr__ are recognized as snake_case.
+            snake = [
+                n for n in names
+                if (s := n.strip("_")) and re.match(r"^[a-z][a-z0-9]*(_[a-z0-9]+)+$", s)
+            ]
+            camel = [
+                n for n in names
+                if re.match(r"^[a-z][a-zA-Z0-9]*$", n) and any(c.isupper() for c in n)
+            ]
+            total = len(names)
+            if total == 0:
+                continue
+
+            if len(snake) >= len(camel):
+                pct = len(snake) / total
+                out.append(Convention(
+                    category="naming",
+                    pattern=f"{lang_label} functions use snake_case ({int(pct * 100)}% of {true_total} functions)",
+                    confidence=pct,
+                    examples=snake[:3],
+                ))
+            else:
+                pct = len(camel) / total
+                out.append(Convention(
+                    category="naming",
+                    pattern=f"{lang_label} functions use camelCase ({int(pct * 100)}% of {true_total} functions)",
+                    confidence=pct,
+                    examples=camel[:3],
+                ))
 
     def _detect_class_naming(self, out: list[Convention]) -> None:
         classes = self._graph.get_all_classes(max_results=5000)
         if not classes:
             return
-        true_total = len(classes)
 
-        names = [c.get("name", "") for c in classes]
-        names = [n for n in names if n]
+        # Group by language
+        by_lang: dict[str, list[dict]] = {}
+        for c in classes:
+            lang = c.get("language", "unknown")
+            by_lang.setdefault(lang, []).append(c)
 
-        pascal = [
-            n for n in names
-            if (s := n.lstrip("_")) and re.match(r"^[A-Z][a-zA-Z0-9]*$", s)
-        ]
-        total = len(names)
-        if total == 0:
-            return
+        for lang, lang_classes in by_lang.items():
+            lang_label = lang.capitalize()
+            true_total = len(lang_classes)
 
-        pct = len(pascal) / total
-        out.append(Convention(
-            category="naming",
-            pattern=f"Classes use PascalCase ({int(pct * 100)}% of {true_total} classes)",
-            confidence=pct,
-            examples=pascal[:3],
-        ))
+            names = [c.get("name", "") for c in lang_classes]
+            names = [n for n in names if n]
+
+            pascal = [
+                n for n in names
+                if (s := n.lstrip("_")) and re.match(r"^[A-Z][a-zA-Z0-9]*$", s)
+            ]
+            total = len(names)
+            if total == 0:
+                continue
+
+            pct = len(pascal) / total
+            out.append(Convention(
+                category="naming",
+                pattern=f"{lang_label} classes use PascalCase ({int(pct * 100)}% of {true_total} classes)",
+                confidence=pct,
+                examples=pascal[:3],
+            ))
 
     def _detect_file_naming(self, out: list[Convention]) -> None:
         files = self._graph.get_all_files(max_results=500)
@@ -147,11 +179,17 @@ class ConventionDetector:
         if not stems:
             return
 
-        total = len(stems)
-        snake = [s for s in stems if re.match(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$", s)]
+        # Require at least one separator to classify style.
+        # Single-word lowercase files (e.g., "utils", "types") are ambiguous
+        # and inflate snake_case counts if included.
+        snake = [s for s in stems if re.match(r"^[a-z][a-z0-9]*(_[a-z0-9]+)+$", s)]
         kebab = [s for s in stems if re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)+$", s)]
         pascal = [s for s in stems if re.match(r"^[A-Z][a-zA-Z0-9]*$", s)]
         camel = [s for s in stems if re.match(r"^[a-z][a-zA-Z0-9]*$", s) and any(c.isupper() for c in s)]
+
+        # Count files that have a clear naming signal (separator or casing)
+        styled_count = len(snake) + len(kebab) + len(pascal) + len(camel)
+        total = styled_count if styled_count > 0 else len(stems)
 
         # Find the dominant style
         styles = [
@@ -264,63 +302,79 @@ class ConventionDetector:
     # Typing conventions
     # ------------------------------------------------------------------
 
-    def detect_typing_conventions(self) -> list[Convention]:
+    def detect_typing_conventions(
+        self, all_functions: list[dict] | None = None,
+    ) -> list[Convention]:
         """Detect type annotation usage patterns."""
         conventions: list[Convention] = []
-        functions = self._graph.get_all_functions(max_results=5000)
+        functions = all_functions or self._graph.get_all_functions(
+            max_results=3000, include_methods=True,
+        )
         if not functions:
             return conventions
-        true_total = len(functions)
 
-        signatures = [f.get("signature", "") for f in functions[:500]]
-        total = len(signatures)
-        if total == 0:
-            return conventions
+        # Group by language
+        by_lang: dict[str, list[dict]] = {}
+        for f in functions:
+            lang = f.get("language", "unknown")
+            by_lang.setdefault(lang, []).append(f)
 
-        # Return type annotations
-        with_return = [s for s in signatures if "->" in s]
-        pct = len(with_return) / total
+        for lang, lang_funcs in by_lang.items():
+            lang_label = lang.capitalize()
+            true_total = len(lang_funcs)
 
-        if pct > 0.5:
-            conventions.append(Convention(
-                category="typing",
-                pattern=f"{int(pct * 100)}% of functions have return type annotations ({len(with_return)}/{true_total})",
-                confidence=pct,
-                examples=with_return[:3],
-            ))
-        elif pct < 0.2:
-            without_return = [s for s in signatures if "->" not in s]
-            conventions.append(Convention(
-                category="typing",
-                pattern=f"Minimal type annotations ({int(pct * 100)}% of functions have return types)",
-                confidence=1 - pct,
-                examples=without_return[:3],
-            ))
+            signatures = [f.get("signature", "") for f in lang_funcs[:500]]
+            total = len(signatures)
+            if total == 0:
+                continue
 
-        # Parameter type annotations
-        with_param_types = []
-        for sig in signatures:
-            paren_start = sig.find("(")
-            paren_end = sig.find(")")
-            if paren_start >= 0 and paren_end >= 0:
-                params_str = sig[paren_start + 1:paren_end]
-                parts = [p.strip() for p in params_str.split(",") if p.strip()]
-                typed = [
-                    p for p in parts
-                    if ":" in p and p.split(":")[0].strip() not in ("self", "cls")
-                ]
-                if typed:
-                    with_param_types.append(sig)
+            # Return type annotations — use regex to ensure '->' follows
+            # the closing paren, not just appears anywhere in the signature
+            # (e.g. dict literals with '->' in default values)
+            with_return = [s for s in signatures if re.search(r'\)\s*->', s)]
+            pct = len(with_return) / total
 
-        if total > 0:
-            pct_params = len(with_param_types) / total
-            if pct_params > 0.3:
+            if pct > 0.5:
                 conventions.append(Convention(
                     category="typing",
-                    pattern=f"{int(pct_params * 100)}% of functions have parameter type annotations",
-                    confidence=pct_params,
-                    examples=with_param_types[:3],
+                    pattern=f"{lang_label}: {int(pct * 100)}% of functions have return type annotations ({len(with_return)}/{true_total})",
+                    confidence=pct,
+                    examples=with_return[:3],
                 ))
+            elif pct < 0.2:
+                without_return = [s for s in signatures if "->" not in s]
+                conventions.append(Convention(
+                    category="typing",
+                    pattern=f"{lang_label}: Minimal type annotations ({int(pct * 100)}% of functions have return types)",
+                    confidence=1 - pct,
+                    examples=without_return[:3],
+                ))
+
+            # Parameter type annotations
+            with_param_types = []
+            for sig in signatures:
+                paren_start = sig.find("(")
+                paren_end = sig.find(")")
+                if paren_start >= 0 and paren_end >= 0:
+                    params_str = sig[paren_start + 1:paren_end]
+                    parts = [p.strip() for p in params_str.split(",") if p.strip()]
+                    typed = [
+                        p for p in parts
+                        if ":" in p.split("=")[0]
+                        and p.split("=")[0].split(":")[0].strip() not in ("self", "cls")
+                    ]
+                    if typed:
+                        with_param_types.append(sig)
+
+            if total > 0:
+                pct_params = len(with_param_types) / total
+                if pct_params > 0.3:
+                    conventions.append(Convention(
+                        category="typing",
+                        pattern=f"{lang_label}: {int(pct_params * 100)}% of functions have parameter type annotations",
+                        confidence=pct_params,
+                        examples=with_param_types[:3],
+                    ))
 
         return conventions
 
@@ -328,28 +382,39 @@ class ConventionDetector:
     # Async patterns
     # ------------------------------------------------------------------
 
-    def detect_async_patterns(self) -> list[Convention]:
+    def detect_async_patterns(
+        self, all_functions: list[dict] | None = None,
+    ) -> list[Convention]:
         """Detect async/await usage patterns."""
         conventions: list[Convention] = []
-        functions = self._graph.get_all_functions(max_results=5000)
+        functions = all_functions or self._graph.get_all_functions(
+            max_results=3000, include_methods=True,
+        )
         if not functions:
             return conventions
 
-        true_total = len(functions)
-        total = len(functions)
-        async_names = [
-            f.get("name", "?") for f in functions
-            if f.get("signature", "").startswith("async ")
-        ]
+        # Group by language
+        by_lang: dict[str, list[dict]] = {}
+        for f in functions:
+            lang = f.get("language", "unknown")
+            by_lang.setdefault(lang, []).append(f)
 
-        if async_names and total > 0:
-            pct = len(async_names) / total
-            conventions.append(Convention(
-                category="async",
-                pattern=f"{int(pct * 100)}% of functions are async ({len(async_names)}/{true_total})",
-                confidence=max(pct, 0.5),
-                examples=async_names[:3],
-            ))
+        for lang, lang_funcs in by_lang.items():
+            lang_label = lang.capitalize()
+            true_total = len(lang_funcs)
+            async_names = [
+                f.get("name", "?") for f in lang_funcs
+                if f.get("signature", "").startswith("async ")
+            ]
+
+            if async_names and true_total > 0:
+                pct = len(async_names) / true_total
+                conventions.append(Convention(
+                    category="async",
+                    pattern=f"{lang_label}: {int(pct * 100)}% of functions are async ({len(async_names)}/{true_total})",
+                    confidence=max(pct, 0.5),
+                    examples=async_names[:3],
+                ))
 
         return conventions
 
@@ -357,91 +422,103 @@ class ConventionDetector:
     # Docstring conventions
     # ------------------------------------------------------------------
 
-    def detect_docstring_conventions(self) -> list[Convention]:
+    def detect_docstring_conventions(
+        self, all_functions: list[dict] | None = None,
+    ) -> list[Convention]:
         """Detect docstring style patterns (Google, NumPy, Sphinx, or none)."""
         conventions: list[Convention] = []
         # Include methods to get accurate coverage — excluding them inflates
         # the stat because __init__, __repr__, helpers often lack docstrings.
-        functions = self._graph.get_all_functions(max_results=5000, include_methods=True)
+        functions = all_functions or self._graph.get_all_functions(
+            max_results=3000, include_methods=True,
+        )
         if not functions:
             return conventions
 
-        true_total = len(functions)
-        total = len(functions)
-        docstrings = [f.get("docstring") or "" for f in functions]
-        docstrings = [d for d in docstrings if d and d.strip()]
+        # Group by language
+        by_lang: dict[str, list[dict]] = {}
+        for f in functions:
+            lang = f.get("language", "unknown")
+            by_lang.setdefault(lang, []).append(f)
 
-        if not docstrings:
+        for lang, lang_funcs in by_lang.items():
+            lang_label = lang.capitalize()
+            true_total = len(lang_funcs)
+            total = true_total
+            docstrings = [f.get("docstring") or "" for f in lang_funcs]
+            docstrings = [d for d in docstrings if d and d.strip()]
+
+            if not docstrings:
+                conventions.append(Convention(
+                    category="docstrings",
+                    pattern=f"{lang_label}: No docstrings found across {true_total} functions",
+                    confidence=0.9,
+                    examples=[],
+                ))
+                continue
+
+            # Coverage
+            coverage = len(docstrings) / total
+
+            # Detect style by scanning docstring bodies
+            google_count = 0  # "Args:", "Returns:", "Raises:"
+            numpy_count = 0   # "Parameters\n----------"
+            sphinx_count = 0  # ":param", ":returns:", ":type"
+            plain_count = 0   # No structured sections
+
+            google_examples: list[str] = []
+            numpy_examples: list[str] = []
+            sphinx_examples: list[str] = []
+
+            for doc in docstrings:
+                if re.search(r"^\s*(Args|Returns|Raises|Yields|Attributes)\s*:", doc, re.MULTILINE):
+                    google_count += 1
+                    if len(google_examples) < 3:
+                        google_examples.append(doc.strip().split("\n")[0][:80])
+                elif re.search(r"^\s*Parameters\s*\n\s*-{3,}", doc, re.MULTILINE):
+                    numpy_count += 1
+                    if len(numpy_examples) < 3:
+                        numpy_examples.append(doc.strip().split("\n")[0][:80])
+                elif re.search(r":(param|type|returns|rtype|raises)\s", doc):
+                    sphinx_count += 1
+                    if len(sphinx_examples) < 3:
+                        sphinx_examples.append(doc.strip().split("\n")[0][:80])
+                else:
+                    plain_count += 1
+
+            # Report coverage
             conventions.append(Convention(
                 category="docstrings",
-                pattern=f"No docstrings found across {true_total} functions",
-                confidence=0.9,
-                examples=[],
-            ))
-            return conventions
-
-        # Coverage
-        coverage = len(docstrings) / total
-
-        # Detect style by scanning docstring bodies
-        google_count = 0  # "Args:", "Returns:", "Raises:"
-        numpy_count = 0   # "Parameters\n----------"
-        sphinx_count = 0  # ":param", ":returns:", ":type"
-        plain_count = 0   # No structured sections
-
-        google_examples: list[str] = []
-        numpy_examples: list[str] = []
-        sphinx_examples: list[str] = []
-
-        for doc in docstrings:
-            if re.search(r"^\s*(Args|Returns|Raises|Yields|Attributes)\s*:", doc, re.MULTILINE):
-                google_count += 1
-                if len(google_examples) < 3:
-                    google_examples.append(doc.strip().split("\n")[0][:80])
-            elif re.search(r"^\s*Parameters\s*\n\s*-{3,}", doc, re.MULTILINE):
-                numpy_count += 1
-                if len(numpy_examples) < 3:
-                    numpy_examples.append(doc.strip().split("\n")[0][:80])
-            elif re.search(r":(param|type|returns|rtype|raises)\s", doc):
-                sphinx_count += 1
-                if len(sphinx_examples) < 3:
-                    sphinx_examples.append(doc.strip().split("\n")[0][:80])
-            else:
-                plain_count += 1
-
-        # Report coverage
-        conventions.append(Convention(
-            category="docstrings",
-            pattern=f"{int(coverage * 100)}% of functions have docstrings ({len(docstrings)}/{true_total})",
-            confidence=coverage,
-            examples=docstrings[:3],
-        ))
-
-        # Report dominant style
-        style_counts = {
-            "Google style (Args/Returns sections)": (google_count, google_examples),
-            "NumPy style (Parameters/underline sections)": (numpy_count, numpy_examples),
-            "Sphinx style (:param/:returns: tags)": (sphinx_count, sphinx_examples),
-        }
-
-        best_style = max(style_counts.items(), key=lambda x: x[1][0])
-        if best_style[1][0] > 0:
-            style_name, (count, examples) = best_style
-            pct = count / len(docstrings)
-            conventions.append(Convention(
-                category="docstrings",
-                pattern=f"Docstrings use {style_name} ({int(pct * 100)}% of {len(docstrings)} docstrings)",
-                confidence=pct,
-                examples=examples,
+                pattern=f"{lang_label}: {int(coverage * 100)}% of functions have docstrings ({len(docstrings)}/{true_total})",
+                confidence=coverage,
+                examples=docstrings[:3],
             ))
 
-        if plain_count > 0 and plain_count == len(docstrings):
-            conventions.append(Convention(
-                category="docstrings",
-                pattern="Docstrings are plain text (no structured format)",
-                confidence=0.8,
-                examples=[d.strip().split("\n")[0][:80] for d in docstrings[:3]],
-            ))
+            # Report dominant style
+            style_counts = {
+                "Google style (Args/Returns sections)": (google_count, google_examples),
+                "NumPy style (Parameters/underline sections)": (numpy_count, numpy_examples),
+                "Sphinx style (:param/:returns: tags)": (sphinx_count, sphinx_examples),
+            }
+
+            best_style = max(style_counts.items(), key=lambda x: x[1][0])
+            if best_style[1][0] > 0:
+                style_name, (count, examples) = best_style
+                pct = count / len(docstrings)
+                conventions.append(Convention(
+                    category="docstrings",
+                    pattern=f"{lang_label}: Docstrings use {style_name} ({int(pct * 100)}% of {len(docstrings)} docstrings)",
+                    confidence=pct,
+                    examples=examples,
+                ))
+
+            if plain_count > 0 and plain_count == len(docstrings):
+                conventions.append(Convention(
+                    category="docstrings",
+                    pattern=f"{lang_label}: Docstrings are plain text (no structured format)",
+                    confidence=0.8,
+                    examples=[d.strip().split("\n")[0][:80] for d in docstrings[:3]],
+                ))
 
         return conventions
 
@@ -453,89 +530,80 @@ class ConventionDetector:
         """Detect import style patterns (absolute vs relative, ordering)."""
         conventions: list[Convention] = []
 
-        # Get raw import data from graph-sitter codebases
-        all_imports: list[dict] = []
-        with self._graph._lock:
-            for lang, codebase in self._graph._codebases.items():
-                try:
-                    for f in codebase.files:
-                        imports = safe_get_attr(f, "imports", [])
-                        if not imports:
-                            continue
-                        fpath = str(safe_get_attr(f, "filepath", safe_get_attr(f, "path", "")))
-                        seen_stmts: set[tuple[str, str]] = set()
-                        for imp in imports:
-                            source = safe_str(safe_get_attr(imp, "source", ""))
-                            if not source:
-                                source = safe_str(imp)
-                            # Deduplicate: count import STATEMENTS not names.
-                            # "from X import a, b, c" may appear as 3 objects
-                            # but is one statement. Key on (file, module).
-                            module = source.replace("from ", "").split(" import ")[0].strip()
-                            if not module:
-                                module = source
-                            stmt_key = (fpath, module)
-                            if stmt_key in seen_stmts:
-                                continue
-                            seen_stmts.add(stmt_key)
-                            all_imports.append({
-                                "source": source,
-                                "file": fpath,
-                                "language": lang,
-                            })
-                except Exception:
-                    continue
+        # Use pre-cached import sources from index building (collected
+        # during _build_import_index which already iterates all files).
+        # This avoids re-iterating graph-sitter objects (slow V8 bridge).
+        all_imports: list[dict] = getattr(
+            self._graph, "_convention_import_sources", None,
+        ) or []
 
         if not all_imports:
             return conventions
 
-        # Analyze import sources
-        relative_imports = []
-        absolute_imports = []
-
+        # Group by language for per-language reporting
+        imports_by_lang: dict[str, list[dict]] = {}
         for imp in all_imports:
-            src = imp["source"].strip()
-            if src.startswith(".") or src.startswith("from ."):
-                relative_imports.append(src)
-            elif src:
-                absolute_imports.append(src)
+            lang = imp.get("language", "unknown")
+            imports_by_lang.setdefault(lang, []).append(imp)
 
-        total = len(relative_imports) + len(absolute_imports)
-        if total == 0:
-            return conventions
+        for lang, lang_imports in imports_by_lang.items():
+            lang_label = lang.capitalize()
 
-        # Relative vs absolute
-        if relative_imports and absolute_imports:
-            rel_pct = len(relative_imports) / total
-            abs_pct = len(absolute_imports) / total
-            if rel_pct > abs_pct:
+            relative_imports = []
+            absolute_imports = []
+            for imp in lang_imports:
+                src = imp["source"].strip()
+                # Extract the module path for relative/absolute classification.
+                # TS/JS: `import { Foo } from "./bar"` → module is "./bar"
+                # Python: `from .utils import helper` → module is ".utils"
+                # Python: `from app.core import X` → module is "app.core"
+                m = re.search(r'''from\s+['"](.+?)['"]''', src)
+                if m:
+                    # TS/JS style: from "..." or from '...'
+                    module = m.group(1)
+                else:
+                    # Python style: from X import Y  or  import X
+                    module = src.replace("from ", "").split(" import ")[0].strip()
+                if module.startswith(".") or module.startswith(".."):
+                    relative_imports.append(src)
+                elif src:
+                    absolute_imports.append(src)
+
+            total = len(relative_imports) + len(absolute_imports)
+            if total == 0:
+                continue
+
+            if relative_imports and absolute_imports:
+                rel_pct = len(relative_imports) / total
+                abs_pct = len(absolute_imports) / total
+                if rel_pct > abs_pct:
+                    conventions.append(Convention(
+                        category="imports",
+                        pattern=f"{lang_label}: Predominantly relative imports ({int(rel_pct * 100)}% of {total} imports)",
+                        confidence=rel_pct,
+                        examples=relative_imports[:3],
+                    ))
+                else:
+                    conventions.append(Convention(
+                        category="imports",
+                        pattern=f"{lang_label}: Predominantly absolute imports ({int(abs_pct * 100)}% of {total} imports)",
+                        confidence=abs_pct,
+                        examples=absolute_imports[:3],
+                    ))
+            elif relative_imports:
                 conventions.append(Convention(
                     category="imports",
-                    pattern=f"Predominantly relative imports ({int(rel_pct * 100)}% of {total} imports)",
-                    confidence=rel_pct,
+                    pattern=f"{lang_label}: Uses relative imports exclusively ({len(relative_imports)} imports)",
+                    confidence=0.95,
                     examples=relative_imports[:3],
                 ))
-            else:
+            elif absolute_imports:
                 conventions.append(Convention(
                     category="imports",
-                    pattern=f"Predominantly absolute imports ({int(abs_pct * 100)}% of {total} imports)",
-                    confidence=abs_pct,
+                    pattern=f"{lang_label}: Uses absolute imports exclusively ({len(absolute_imports)} imports)",
+                    confidence=0.95,
                     examples=absolute_imports[:3],
                 ))
-        elif relative_imports:
-            conventions.append(Convention(
-                category="imports",
-                pattern=f"Uses relative imports exclusively ({len(relative_imports)} imports)",
-                confidence=0.95,
-                examples=relative_imports[:3],
-            ))
-        elif absolute_imports:
-            conventions.append(Convention(
-                category="imports",
-                pattern=f"Uses absolute imports exclusively ({len(absolute_imports)} imports)",
-                confidence=0.95,
-                examples=absolute_imports[:3],
-            ))
 
         # Detect common third-party packages
         # TypeScript/JavaScript keywords that appear in import statements
@@ -575,52 +643,44 @@ class ConventionDetector:
         """Detect common decorator usage patterns (@property, @classmethod, etc.)."""
         conventions: list[Convention] = []
 
-        # Scan class methods for decorators
-        decorator_counts: dict[str, int] = {}
-        decorator_examples: dict[str, list[str]] = {}
-        total_methods = 0
+        # Use pre-cached decorator info from index building (collected
+        # during _build_caller_index which already iterates all classes/methods).
+        # This avoids re-iterating graph-sitter objects (slow V8 bridge).
+        conv_decorators: dict[str, dict[str, tuple[int, list[str]]]] = getattr(
+            self._graph, "_convention_decorator_info", None,
+        ) or {}
+        conv_method_counts: dict[str, int] = getattr(
+            self._graph, "_convention_method_counts", None,
+        ) or {}
 
-        with self._graph._lock:
-            for lang, codebase in self._graph._codebases.items():
-                try:
-                    for cls in codebase.classes:
-                        cls_name = safe_get_attr(cls, "name", "")
-                        methods = safe_get_attr(cls, "methods", [])
-                        if not methods:
-                            continue
-                        for m in methods:
-                            total_methods += 1
-                            decorators = safe_get_attr(m, "decorators", [])
-                            if not decorators:
-                                continue
-                            m_name = safe_get_attr(m, "name", "?")
-                            for d in decorators:
-                                d_str = safe_str(d).strip("@").split("(")[0]
-                                if not d_str:
-                                    continue
-                                decorator_counts[d_str] = decorator_counts.get(d_str, 0) + 1
-                                if d_str not in decorator_examples:
-                                    decorator_examples[d_str] = []
-                                if len(decorator_examples[d_str]) < 3:
-                                    label = f"{cls_name}.{m_name}" if cls_name else m_name
-                                    decorator_examples[d_str].append(label)
-                except Exception:
-                    continue
+        # Reshape cached data into the format expected below
+        lang_decorator_counts: dict[str, dict[str, int]] = {}
+        lang_decorator_examples: dict[str, dict[str, list[str]]] = {}
+        lang_total_methods: dict[str, int] = conv_method_counts
 
-        if not decorator_counts or total_methods == 0:
-            return conventions
+        for lang, dec_map in conv_decorators.items():
+            lang_decorator_counts[lang] = {}
+            lang_decorator_examples[lang] = {}
+            for d_str, (count, examples) in dec_map.items():
+                lang_decorator_counts[lang][d_str] = count
+                lang_decorator_examples[lang][d_str] = examples
 
-        # Report significant decorator patterns (used 3+ times)
-        for dec_name, count in sorted(decorator_counts.items(), key=lambda x: -x[1]):
-            if count < 3:
+        for lang, decorator_counts in lang_decorator_counts.items():
+            lang_label = lang.capitalize()
+            total_methods = lang_total_methods.get(lang, 0)
+            if not decorator_counts or total_methods == 0:
                 continue
-            pct = count / total_methods
-            examples = decorator_examples.get(dec_name, [])
-            conventions.append(Convention(
-                category="decorators",
-                pattern=f"@{dec_name} used on {count} methods ({int(pct * 100)}% of {total_methods} class methods)",
-                confidence=min(0.95, pct + 0.5) if count >= 5 else 0.6,
-                examples=examples,
-            ))
+
+            for dec_name, count in sorted(decorator_counts.items(), key=lambda x: -x[1]):
+                if count < 3:
+                    continue
+                pct = count / total_methods
+                examples = lang_decorator_examples.get(lang, {}).get(dec_name, [])
+                conventions.append(Convention(
+                    category="decorators",
+                    pattern=f"{lang_label}: @{dec_name} used on {count} methods ({int(pct * 100)}% of {total_methods} class methods)",
+                    confidence=min(0.95, pct + 0.5) if count >= 5 else 0.6,
+                    examples=examples,
+                ))
 
         return conventions

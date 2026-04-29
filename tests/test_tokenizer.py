@@ -113,8 +113,9 @@ class TestCodeTokenizer:
 class TestCodeTokenizerFileLoading:
     def test_ensure_loaded_raises_when_files_missing(self):
         tok = CodeTokenizer()
-        with pytest.raises(FileNotFoundError, match="BPE tokenizer files not found"):
-            tok._ensure_loaded()
+        with patch("grafyx.search._tokenizer._MODEL_DIR", Path("/nonexistent/path")):
+            with pytest.raises(FileNotFoundError, match="BPE tokenizer files not found"):
+                tok._ensure_loaded()
 
     def test_ensure_loaded_from_json(self, tmp_path):
         """Test that _ensure_loaded correctly reads JSON files."""

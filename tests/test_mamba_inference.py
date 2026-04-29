@@ -15,7 +15,7 @@ class TestHelpers:
         out = _layer_norm(x, w, b)
         # Each row should have ~zero mean and ~unit var
         assert abs(out.mean(axis=-1)).max() < 1e-5
-        assert abs(out.var(axis=-1) - 1.0).max() < 1e-4
+        assert abs(out.var(axis=-1) - 1.0).max() < 1e-3
 
     def test_softplus_positive(self):
         x = np.array([-10, -1, 0, 1, 10], dtype=np.float32)

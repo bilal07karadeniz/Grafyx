@@ -280,7 +280,8 @@ class PathMixin:
         """
         parts = path.replace("\\", "/").lower().split("/")
         return any(
-            p in ("test", "tests", "spec", "specs", "testing", "__tests__")
+            p in ("test", "tests", "spec", "specs", "testing", "__tests__",
+                  "load_tests", "__mocks__")
             for p in parts
         )
 

@@ -39,7 +39,7 @@ _SIGNATURES_STRIP: dict[str, set[str]] = {
         "dependencies", "source", "is_async",
     },
     "file": {
-        "source", "imported_by",
+        "source", "imported_by", "imported_by_count",
     },
     "class": {
         "cross_file_usages", "internal_usage_count",

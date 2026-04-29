@@ -271,3 +271,102 @@ class TestReceiverTokenInGetCallers:
         assert len(notify_callers) == 1
         assert notify_callers[0]["receiver_token"] is None
         assert notify_callers[0]["has_dot_syntax"] is False
+
+
+class TestMethodNameCollisionFilter:
+    """When querying a standalone function whose name collides with a class
+    method, dot-syntax callers (obj.method()) should be filtered out."""
+
+    def test_standalone_with_dot_collision_filtered(self):
+        """get_callers('refresh') with no class_name should filter db.refresh() callers."""
+        graph = _make_graph()
+        # Register 'refresh' as a class method of Session
+        graph._class_method_names = {"Session": {"refresh", "commit", "close"}}
+
+        # Two callers: one dot-syntax (db.refresh), one standalone (refresh())
+        graph._caller_index = {
+            "refresh": [
+                {"name": "handler_a", "file": "/project/a.py", "_has_dot_syntax": True, "_receivers": {"db"}},
+                {"name": "handler_b", "file": "/project/b.py", "_has_dot_syntax": False, "_receivers": None},
+            ],
+        }
+        result = graph.get_callers("refresh")
+        names = [r["name"] for r in result]
+        # Dot-syntax caller filtered, standalone kept
+        assert "handler_b" in names
+        assert "handler_a" not in names
+
+    def test_standalone_without_collision_all_returned(self):
+        """get_callers('unique_func') with no class collision should return all callers."""
+        graph = _make_graph()
+        graph._class_method_names = {"Session": {"refresh", "commit"}}
+
+        graph._caller_index = {
+            "unique_func": [
+                {"name": "caller_x", "file": "/project/x.py", "_has_dot_syntax": True, "_receivers": {"obj"}},
+                {"name": "caller_y", "file": "/project/y.py", "_has_dot_syntax": False, "_receivers": None},
+            ],
+        }
+        result = graph.get_callers("unique_func")
+        names = [r["name"] for r in result]
+        # No collision with class methods -> all returned
+        assert "caller_x" in names
+        assert "caller_y" in names
+
+    def test_trusted_entries_bypass_filter(self):
+        """Trusted callers should be kept even with dot-syntax and collision."""
+        graph = _make_graph()
+        graph._class_method_names = {"Session": {"refresh"}}
+
+        graph._caller_index = {
+            "refresh": [
+                {"name": "handler_trusted", "file": "/project/t.py", "_has_dot_syntax": True,
+                 "_receivers": {"session"}, "_trusted": True},
+                {"name": "handler_dot", "file": "/project/d.py", "_has_dot_syntax": True,
+                 "_receivers": {"db"}, "_trusted": False},
+                {"name": "handler_plain", "file": "/project/p.py", "_has_dot_syntax": False,
+                 "_receivers": None},
+            ],
+        }
+        result = graph.get_callers("refresh")
+        names = [r["name"] for r in result]
+        # Trusted kept, non-trusted dot-syntax filtered, standalone kept
+        assert "handler_trusted" in names
+        assert "handler_plain" in names
+        assert "handler_dot" not in names
+
+    def test_external_library_method_detected(self):
+        """External library methods (e.g. SQLAlchemy Session.refresh) should
+        be detected via caller dot-syntax ratio, even without _class_method_names."""
+        graph = _make_graph()
+        # No codebase class defines 'refresh' — it's from an external library
+        graph._class_method_names = {}
+
+        # 4+ callers, all using dot syntax (db.refresh(), session.refresh(), etc.)
+        graph._caller_index = {
+            "refresh": [
+                {"name": f"handler_{i}", "file": f"/project/{i}.py",
+                 "_has_dot_syntax": True, "_receivers": {"db"}}
+                for i in range(5)
+            ],
+        }
+        result = graph.get_callers("refresh")
+        # >80% dot syntax → detected as external method → all filtered
+        assert len(result) == 0
+
+    def test_mixed_callers_below_threshold_not_filtered(self):
+        """When dot-syntax ratio is below 80%, no filtering applied."""
+        graph = _make_graph()
+        graph._class_method_names = {}
+
+        graph._caller_index = {
+            "process": [
+                {"name": "a", "file": "/project/a.py", "_has_dot_syntax": True, "_receivers": {"mod"}},
+                {"name": "b", "file": "/project/b.py", "_has_dot_syntax": False, "_receivers": None},
+                {"name": "c", "file": "/project/c.py", "_has_dot_syntax": False, "_receivers": None},
+                {"name": "d", "file": "/project/d.py", "_has_dot_syntax": False, "_receivers": None},
+            ],
+        }
+        result = graph.get_callers("process")
+        # 25% dot syntax → below threshold → all returned
+        assert len(result) == 4

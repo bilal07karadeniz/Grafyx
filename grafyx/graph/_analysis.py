@@ -14,24 +14,13 @@ tools that go beyond simple lookups to provide actionable insights:
         - Migration files (auto-generated, called by framework)
         - Symbols that appear in import statements elsewhere
 
-    **Circular import detection** (``find_import_cycles``):
-        DFS with gray/black coloring on the forward import graph to detect
-        cycles like A -> B -> C -> A. Normalizes cycles by rotating to the
-        lexicographically smallest element to avoid reporting the same cycle
-        starting from different nodes.
-
     **Subclass tree traversal** (``get_subclasses``):
         Recursively builds a tree of all classes extending a given base class,
         up to a configurable depth.
 
-    **Module dependency aggregation** (``get_module_dependencies``):
-        Aggregates file-level imports into directory/package-level edges,
-        with optional filtering by module path and debug mode showing
-        sample file-to-file edges for each module edge.
-
 Mixin: AnalysisMixin
 Reads: self._codebases, self._lock, self._caller_index, self._class_method_names,
-       self._forward_import_index, self._class_defined_in, self._import_index
+       self._class_defined_in, self._import_index
 Writes: nothing (read-only analysis)
 """
 
@@ -48,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 class AnalysisMixin:
-    """Dead code detection, cycle finding, subclass trees, and module dependencies.
+    """Dead code detection and subclass trees.
 
     This mixin contains the most computationally expensive operations in the
     graph engine. Dead code detection in particular iterates all functions
@@ -56,7 +45,7 @@ class AnalysisMixin:
     ``self._lock`` for thread safety.
 
     Reads: _codebases, _lock, _caller_index, _class_method_names,
-    _forward_import_index, _class_defined_in, _import_index
+    _class_defined_in, _import_index
     """
 
     # Base classes that indicate abstract/protocol patterns --
@@ -135,6 +124,10 @@ class AnalysisMixin:
             "__neg__", "__pos__", "__abs__", "__invert__",
             "__complex__", "__int__", "__float__", "__index__",
             "__post_init__",
+            # unittest lifecycle (called by test runner)
+            "setUp", "tearDown", "setUpClass", "tearDownClass",
+            "setUpModule", "tearDownModule",
+            "asyncSetUp", "asyncTearDown",
             # JS/TS built-in protocol methods
             "constructor", "toString", "valueOf", "toJSON",
             # Middleware dispatch (called by framework)
@@ -169,8 +162,16 @@ class AnalysisMixin:
             "subscriber", "callback", "lifespan",
             "command", "group", "argument", "option",
             "tool",
+            # Pydantic
+            "validator", "root_validator",
+            "field_validator", "model_validator", "field_serializer",
+            "model_serializer", "computed_field",
+            # FastAPI
+            "depends",
             # Celery
             "task", "shared_task", "periodic_task",
+            # Django REST Framework
+            "serializer_method",
             # Angular
             "Component", "Injectable", "Directive", "Pipe", "NgModule",
             "Input", "Output", "HostListener", "HostBinding",
@@ -187,6 +188,19 @@ class AnalysisMixin:
         with self._lock:
             unused: list[dict] = []
             imported_names = self._build_imported_names()
+
+            # Names re-exported via __init__.py / index.ts / index.js.
+            # These are public API surface — unused internally but intentionally
+            # exported.  Flagged separately from genuinely dead code.
+            re_exported_names: set[str] = set()
+            for _imp_path, _targets in getattr(self, "_file_symbol_imports", {}).items():
+                _norm = _imp_path.replace("\\", "/")
+                if (_norm.endswith("/__init__.py")
+                        or _norm.endswith("/index.ts")
+                        or _norm.endswith("/index.js")):
+                    for _tgt, _names in _targets.items():
+                        re_exported_names.update(_names)
+
             all_funcs = self.get_all_functions(
                 max_results=5000, include_methods=True
             )
@@ -246,9 +260,13 @@ class AnalysisMixin:
                 if name == "main" or file_path.replace("\\", "/").endswith("__main__.py"):
                     continue
 
-                # Check if this function is explicitly imported by name elsewhere
+                # Check if this function is explicitly imported by name elsewhere.
+                # For top-level functions, also verify they're actually CALLED
+                # (not just re-exported). Re-exports inflate imported_names.
                 if not class_name and name in imported_names:
-                    continue
+                    if self._caller_index.get(name, []):
+                        continue
+                    # Fall through — imported/re-exported but never called
 
                 # Fast path: O(1) check on _caller_index. If no raw callers
                 # exist at all, the function is definitely unused (skip directly
@@ -264,6 +282,30 @@ class AnalysisMixin:
                     else:
                         # Top-level function with any caller -> definitely used
                         continue
+
+                # --- Text search fallback ---
+                # When static analysis finds zero callers, scan source files for
+                # the symbol name as a call pattern. This catches:
+                # - instance.method() where instance type is unknown
+                # - callbacks in dicts, getattr(), string registries
+                # - Top-level functions used via indirect patterns
+                _call_pattern = f".{name}(" if class_name else f"{name}("
+                _found_text_ref = False
+                for _lang2, _codebase2 in self._codebases.items():
+                    if _found_text_ref:
+                        break
+                    for _f2 in _codebase2.files:
+                        _f2_path = self.translate_path(
+                            str(safe_get_attr(_f2, "filepath", safe_get_attr(_f2, "path", "")))
+                        )
+                        if _f2_path == file_path:
+                            continue  # Skip the defining file
+                        _src2 = safe_str(safe_get_attr(_f2, "source", ""))
+                        if _call_pattern in _src2:
+                            _found_text_ref = True
+                            break
+                if _found_text_ref:
+                    continue
 
                 # Expensive path: check decorators and usages on potentially
                 # unused functions. This requires fetching the full function
@@ -347,14 +389,17 @@ class AnalysisMixin:
                 qualified = f"{class_name}.{name}" if class_name else name
                 kind = "method" if class_name else "function"
 
-                unused.append({
+                entry: dict = {
                     "name": name,
                     "qualified_name": qualified,
                     "file": file_path,
                     "line": func_dict.get("line"),
                     "kind": kind,
                     "language": func_dict.get("language", ""),
-                })
+                }
+                if name in re_exported_names:
+                    entry["re_exported"] = True
+                unused.append(entry)
 
             unused.sort(key=lambda x: (x.get("file", ""), x.get("line") or 0))
             return unused
@@ -390,16 +435,24 @@ class AnalysisMixin:
         # is implicit (serialization, ORM queries, middleware dispatch, etc.)
         FRAMEWORK_BASES = {
             # Pydantic
-            "BaseModel", "BaseSettings", "GenericModel",
+            "BaseModel", "BaseSettings", "GenericModel", "RootModel",
             # SQLAlchemy
             "Base", "DeclarativeBase", "DeclarativeBaseNoMeta",
             # Django
             "Model", "View", "Serializer", "ModelSerializer",
             "Form", "ModelForm", "ModelAdmin", "AppConfig",
+            "TestCase", "TransactionTestCase", "SimpleTestCase",
+            "LiveServerTestCase",
+            "Command", "BaseCommand",
             # Starlette / FastAPI
             "BaseHTTPMiddleware",
+            # Flask
+            "FlaskForm", "Resource", "MethodView",
             # Marshmallow
             "Schema",
+            # Python stdlib / typing
+            "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+            "TypedDict", "NamedTuple",
             # React
             "Component", "PureComponent",
             # Angular (though Angular mostly uses decorators)
@@ -408,6 +461,8 @@ class AnalysisMixin:
             "BaseEntity",
             # Abstract / Protocol
             "Protocol", "ABC",
+            # Testing
+            "TestCase",
         }
 
         with self._lock:
@@ -507,65 +562,6 @@ class AnalysisMixin:
             return unused
 
     # ===================================================================
-    # Circular Import Detection
-    # ===================================================================
-
-    def find_import_cycles(self, max_chain_length: int = 10) -> list[list[str]]:
-        """Detect circular import chains using DFS with gray/black coloring.
-
-        Uses the standard 3-color DFS algorithm on ``_forward_import_index``:
-            - WHITE (0): unvisited
-            - GRAY (1): on the current DFS path (back-edge target = cycle)
-            - BLACK (2): fully explored
-
-        Cycles are normalized by rotating to the lexicographically smallest
-        element so the same cycle starting from different nodes is only
-        reported once.
-
-        Returns:
-            List of cycles, each a list of file paths where ``first == last``.
-            Sorted by length ascending (shortest cycles = most actionable).
-        """
-        with self._lock:
-            WHITE, GRAY, BLACK = 0, 1, 2
-            color: dict[str, int] = {}
-            path_stack: list[str] = []
-            cycles: list[list[str]] = []
-            seen_cycle_keys: set[str] = set()
-
-            for node in self._forward_import_index:
-                color.setdefault(node, WHITE)
-
-            def _dfs(node: str) -> None:
-                color[node] = GRAY
-                path_stack.append(node)
-
-                for neighbor in self._forward_import_index.get(node, []):
-                    if color.get(neighbor, WHITE) == GRAY:
-                        cycle_start = path_stack.index(neighbor)
-                        cycle = path_stack[cycle_start:] + [neighbor]
-                        if len(cycle) - 1 <= max_chain_length:
-                            chain = cycle[:-1]
-                            min_idx = chain.index(min(chain))
-                            normalized = chain[min_idx:] + chain[:min_idx]
-                            cycle_key = "->".join(normalized)
-                            if cycle_key not in seen_cycle_keys:
-                                seen_cycle_keys.add(cycle_key)
-                                cycles.append(cycle)
-                    elif color.get(neighbor, WHITE) == WHITE:
-                        _dfs(neighbor)
-
-                path_stack.pop()
-                color[node] = BLACK
-
-            for node in list(self._forward_import_index.keys()):
-                if color.get(node, WHITE) == WHITE:
-                    _dfs(node)
-
-            cycles.sort(key=len)
-            return cycles
-
-    # ===================================================================
     # Subclass Tree Traversal
     # ===================================================================
 
@@ -647,183 +643,3 @@ class AnalysisMixin:
                 "subclasses": tree,
             }
 
-    # ===================================================================
-    # Module-Level Dependency Aggregation
-    # ===================================================================
-
-    def get_module_dependencies(
-        self, module_path: str = "", depth: int = 1, debug: bool = False,
-    ) -> dict:
-        """Show how directories/packages depend on each other.
-
-        Aggregates file-level imports from ``_forward_import_index`` into
-        module-level (directory) dependencies. Each file is assigned to a
-        "module" based on its directory path truncated to the given depth.
-
-        For example, at depth=1, ``src/services/auth.py`` and
-        ``src/services/users.py`` both belong to module ``src``.
-        At depth=2, they belong to ``src/services``.
-
-        Args:
-            module_path: Optional filter -- only show edges involving this
-                module (or its sub-modules). Depth is auto-adjusted so the
-                target module is visible as a distinct node.
-            depth: Subdirectory grouping depth (1 = top-level dirs only).
-            debug: If True, include ``debug_file_edges`` showing up to 5
-                sample file-to-file imports for each module edge.
-
-        Returns:
-            Dict with ``modules`` (each with depends_on/depended_on_by),
-            ``edges`` (sorted by import_count descending), and ``module_count``.
-        """
-        with self._lock:
-            all_files = self.get_all_files(max_results=2000)
-            project_root = self.original_path.replace("\\", "/").rstrip("/") + "/"
-
-            # Auto-adjust depth so module_path is visible as a distinct module
-            if module_path:
-                mp_clean = module_path.strip("/")
-                min_depth = len(mp_clean.split("/"))
-                if depth < min_depth:
-                    depth = min_depth
-
-            # Assign each file to a module (directory) at the given depth.
-            # Strips the project root prefix and truncates the directory path
-            # to `depth` components. Files at the project root get module ".".
-            def _get_module(file_path: str) -> str:
-                fp = file_path.replace("\\", "/")
-                if fp.startswith(project_root):
-                    rel = fp[len(project_root):]
-                else:
-                    rel = fp.lstrip("/")
-                parts = rel.split("/")
-                # Strip the filename (last component) -- we want directory grouping.
-                # Without this, a file at exactly `depth` directory levels (e.g.,
-                # "backend/app/utils.py" at depth=3) would include the filename in
-                # its module name ("backend/app/utils.py"), breaking self-import
-                # deduplication and producing false cross-module edges.
-                dir_parts = parts[:-1]
-                if not dir_parts:
-                    return "."  # Root-level files
-                return "/".join(dir_parts[:depth])
-
-            # Build set of known files and their modules
-            file_to_module: dict[str, str] = {}
-            module_files: dict[str, int] = {}  # module -> file count
-            for f in all_files:
-                fpath = f.get("path", "").replace("\\", "/")
-                if not fpath:
-                    continue
-                mod = _get_module(fpath)
-                file_to_module[fpath] = mod
-                module_files[mod] = module_files.get(mod, 0) + 1
-
-            # Also index files from _forward_import_index (may have paths
-            # not returned by get_all_files if they are import targets)
-            for fpath in self._forward_import_index:
-                fp = fpath.replace("\\", "/")
-                if fp not in file_to_module:
-                    mod = _get_module(fp)
-                    file_to_module[fp] = mod
-                for target in self._forward_import_index[fpath]:
-                    tp = target.replace("\\", "/")
-                    if tp not in file_to_module:
-                        file_to_module[tp] = _get_module(tp)
-
-            # Aggregate edges: (from_module, to_module) -> count
-            # Use top-level-only forward index to avoid ghost edges from
-            # lazy imports inside function bodies.
-            _fwd_idx = getattr(self, '_top_level_forward_import_index', None)
-            if not _fwd_idx:
-                _fwd_idx = self._forward_import_index
-            edge_counts: dict[tuple[str, str], int] = {}
-            for source_file, targets in _fwd_idx.items():
-                src_fp = source_file.replace("\\", "/")
-                src_mod = file_to_module.get(src_fp, _get_module(src_fp))
-                for target_file in targets:
-                    tgt_fp = target_file.replace("\\", "/")
-                    tgt_mod = file_to_module.get(tgt_fp, _get_module(tgt_fp))
-                    # Skip self-imports (within same module)
-                    if src_mod == tgt_mod:
-                        continue
-                    key = (src_mod, tgt_mod)
-                    edge_counts[key] = edge_counts.get(key, 0) + 1
-
-            # Build module detail map
-            all_modules: set[str] = set(module_files.keys())
-            for src, tgt in edge_counts:
-                all_modules.add(src)
-                all_modules.add(tgt)
-
-            # Apply module_path filter (exact match or prefix with /)
-            if module_path:
-                mp_clean = module_path.strip("/")
-
-                def _matches_filter(mod: str) -> bool:
-                    return mod == mp_clean or mod.startswith(mp_clean + "/")
-
-                filtered_edges = {
-                    k: v for k, v in edge_counts.items()
-                    if _matches_filter(k[0]) or _matches_filter(k[1])
-                }
-                relevant_modules = set()
-                # Include any modules matching the filter even if they have no edges
-                for mod in all_modules:
-                    if _matches_filter(mod):
-                        relevant_modules.add(mod)
-                for src, tgt in filtered_edges:
-                    relevant_modules.add(src)
-                    relevant_modules.add(tgt)
-                all_modules = relevant_modules
-                edge_counts = filtered_edges
-
-            modules: dict[str, dict] = {}
-            for mod in sorted(all_modules):
-                depends_on = sorted({tgt for (src, tgt), _ in edge_counts.items() if src == mod})
-                depended_on_by = sorted({src for (src, tgt), _ in edge_counts.items() if tgt == mod})
-                modules[mod] = {
-                    "file_count": module_files.get(mod, 0),
-                    "depends_on": depends_on,
-                    "depended_on_by": depended_on_by,
-                }
-
-            edges = [
-                {"from": src, "to": tgt, "import_count": count}
-                for (src, tgt), count in sorted(edge_counts.items(), key=lambda x: -x[1])
-            ]
-
-            result: dict = {
-                "project_path": self.original_path,
-                "module_count": len(modules),
-                "modules": modules,
-                "edges": edges,
-            }
-
-            if debug:
-                # Show up to 5 file-level edges per module edge to aid diagnosis
-                # of false positives (e.g., services->api edges that don't exist).
-                file_edge_samples: dict[str, list[dict]] = {}
-                for source_file, targets in _fwd_idx.items():
-                    src_fp = source_file.replace("\\", "/")
-                    src_mod = file_to_module.get(src_fp, _get_module(src_fp))
-                    for tgt_file in targets:
-                        tgt_fp = tgt_file.replace("\\", "/")
-                        tgt_mod = file_to_module.get(tgt_fp, _get_module(tgt_fp))
-                        if src_mod == tgt_mod:
-                            continue
-                        if module_path:
-                            mp_clean = module_path.strip("/")
-                            if not (src_mod == mp_clean or src_mod.startswith(mp_clean + "/")
-                                    or tgt_mod == mp_clean or tgt_mod.startswith(mp_clean + "/")):
-                                continue
-                        edge_key = f"{src_mod} \u2192 {tgt_mod}"
-                        if edge_key not in file_edge_samples:
-                            file_edge_samples[edge_key] = []
-                        if len(file_edge_samples[edge_key]) < 5:
-                            file_edge_samples[edge_key].append({
-                                "from_file": src_fp,
-                                "to_file": tgt_fp,
-                            })
-                result["debug_file_edges"] = file_edge_samples
-
-            return result

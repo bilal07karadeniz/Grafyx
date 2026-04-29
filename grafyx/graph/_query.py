@@ -340,6 +340,19 @@ class SymbolQueryMixin:
                     logger.error(f"Error getting functions from {lang}: {e}")
                 if len(results) >= max_results:
                     break
+            # Also include object literal methods (TS/JS)
+            for olm in getattr(self, "_object_literal_methods", []):
+                if len(results) >= max_results:
+                    break
+                results.append({
+                    "name": olm["name"],
+                    "file": olm["file"],
+                    "line": olm["line"],
+                    "class_name": olm["parent"],
+                    "language": olm["language"],
+                    "signature": f"{olm['name']}: (...) => ...",
+                    "docstring": "",
+                })
             return results
 
     def iter_functions_with_source(self):
@@ -382,6 +395,9 @@ class SymbolQueryMixin:
                             )
                 except Exception:
                     continue
+            # Also yield object literal methods (TS/JS)
+            for olm in getattr(self, "_object_literal_methods", []):
+                yield (olm["name"], olm["file"], olm.get("source", ""), olm["parent"])
 
     def get_all_classes(
         self,
@@ -484,7 +500,8 @@ class SymbolQueryMixin:
         """Return list of file paths that import the given file (reverse direction).
 
         Tries exact path match first, then falls back to suffix matching
-        for partial paths.
+        for partial paths.  Suffix matching aggregates ALL matches instead
+        of returning on the first hit.
         """
         with self._lock:
             fp_norm = file_path.replace("\\", "/")
@@ -492,11 +509,16 @@ class SymbolQueryMixin:
             result = self._import_index.get(fp_norm, [])
             if result:
                 return list(result)
-            # Try suffix match
+            # Aggregate ALL suffix matches (not just first hit)
+            aggregated: list[str] = []
+            seen: set[str] = set()
             for key, importers in self._import_index.items():
                 if key.endswith(fp_norm) or fp_norm.endswith(key):
-                    return list(importers)
-            return []
+                    for imp in importers:
+                        if imp not in seen:
+                            seen.add(imp)
+                            aggregated.append(imp)
+            return aggregated
 
     def get_forward_imports(self, file_path: str) -> list[str]:
         """Return list of file paths that the given file imports (forward direction).

@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from unittest.mock import patch
 
 from grafyx.search._source_filter import (
     FEATURE_COUNT,
@@ -236,13 +237,13 @@ class TestFilterSourceTokens:
 
     def test_fallback_all_ones_when_no_model(self):
         """Without M3 model weights, all tokens should get weight 1.0."""
-        # Since source_filter_weights.npz does not exist yet, model is None
-        result = filter_source_tokens(
-            ["order", "process", "validate"],
-            "process_order",
-            SAMPLE_SOURCE_SIMPLE,
-            "orders.py",
-        )
+        with patch("grafyx.search._source_filter.get_model", return_value=None):
+            result = filter_source_tokens(
+                ["order", "process", "validate"],
+                "process_order",
+                SAMPLE_SOURCE_SIMPLE,
+                "orders.py",
+            )
         assert isinstance(result, dict)
         assert set(result.keys()) == {"order", "process", "validate"}
         for token, weight in result.items():

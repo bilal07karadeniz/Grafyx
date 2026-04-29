@@ -3,6 +3,7 @@
 Implements the core building blocks for M5 (bi-encoder) and M6 (cross-encoder):
 - selective_scan: The Mamba SSM core — O(n) sequential state update
 - MambaBlock: Full Mamba layer (norm -> in_proj -> SSM -> gate -> out_proj + residual)
+- FeedForwardBlock: Simple FF fallback (norm -> Linear -> SiLU -> Linear + residual)
 - AttentionBlock: Standard self-attention (for hybrid Mamba+Attention models)
 - Helper functions: layer_norm, softplus, silu, softmax
 """
@@ -86,6 +87,30 @@ class MambaBlock:
         y = y @ self.out_proj_w + self.out_proj_b
 
         return y + residual
+
+
+class FeedForwardBlock:
+    """Simple FeedForward fallback for when Mamba SSM is not used.
+
+    Matches MambaBlock interface: norm -> Linear -> SiLU -> Linear + residual.
+    Used by prototype models trained without mamba-ssm.
+    """
+
+    def __init__(self, weights: dict):
+        self.norm_w = xp.asarray(weights["norm_w"])
+        self.norm_b = xp.asarray(weights["norm_b"])
+        self.w1 = xp.asarray(weights["ff_w1"])  # (d_model, d_inner), pre-transposed
+        self.b1 = xp.asarray(weights["ff_b1"])
+        self.w2 = xp.asarray(weights["ff_w2"])  # (d_inner, d_model), pre-transposed
+        self.b2 = xp.asarray(weights["ff_b2"])
+
+    def __call__(self, x):
+        """Forward pass. x: (seq_len, d_model) -> (seq_len, d_model)."""
+        residual = x
+        x = _layer_norm(x, self.norm_w, self.norm_b)
+        x = _silu(x @ self.w1 + self.b1)
+        x = x @ self.w2 + self.b2
+        return x + residual
 
 
 class AttentionBlock:

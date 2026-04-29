@@ -62,9 +62,12 @@ class TestReExportTracking:
             f"Consumer should be in init importers, got: {init_importers}"
         )
 
-    def test_init_self_import_still_skipped(self):
-        """__init__.py importing its own submodule via absolute path should
-        still be skipped in the import index (prevents self-loops)."""
+    def test_init_self_import_recorded_for_reexport(self):
+        """__init__.py importing its own submodule should be recorded in the
+        import index so that transitive dependencies through re-exports work.
+
+        e.g., router.py -> auth/__init__.py -> auth/auth_service.py
+        """
         graph = self._make_graph()
 
         init_file = MagicMock()
@@ -85,6 +88,6 @@ class TestReExportTracking:
 
         graph._build_import_index()
 
-        # __init__.py should NOT appear as an importer of impl.py
+        # __init__.py SHOULD appear as an importer of impl.py (for re-export tracking)
         impl_importers = graph._import_index.get("/project/package/impl.py", [])
-        assert "/project/package/__init__.py" not in impl_importers
+        assert "/project/package/__init__.py" in impl_importers

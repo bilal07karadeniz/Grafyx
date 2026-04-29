@@ -109,38 +109,47 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
     """
     graph = _ensure_initialized()
     try:
-        # --- Disambiguation ---
-        # Try function lookup first to detect ambiguous names.
-        # If multiple matches exist, return a disambiguation list
-        # so the LLM can re-call with a qualified name.
-        func_result = graph.get_function(symbol_name)
-        if isinstance(func_result, list) and len(func_result) > 1:
-            disambiguation = []
-            for _lang, func, cls_name in func_result:
-                qualified = f"{cls_name}.{safe_get_attr(func, 'name', '?')}" if cls_name else safe_get_attr(func, "name", "?")
-                disambiguation.append({
-                    "qualified_name": qualified,
-                    "file": graph.translate_path(str(safe_get_attr(func, "filepath", ""))),
-                    "signature": format_function_signature(func),
+        # --- Symbol resolution ---
+        # Check classes first (exact match, never ambiguous) so that
+        # passing a class name like "CrawlCache" works directly instead
+        # of falling into function disambiguation with its 20 methods.
+        class_result = graph.get_class(symbol_name)
+        if class_result is not None and isinstance(class_result, (tuple, list)):
+            if isinstance(class_result, list):
+                lang, symbol = class_result[0]
+            else:
+                lang, symbol = class_result
+            kind = "class"
+        else:
+            # Not a class — try function lookup with disambiguation
+            func_result = graph.get_function(symbol_name)
+            if isinstance(func_result, list) and len(func_result) > 1:
+                disambiguation = []
+                for _lang, func, cls_name in func_result:
+                    qualified = f"{cls_name}.{safe_get_attr(func, 'name', '?')}" if cls_name else safe_get_attr(func, "name", "?")
+                    disambiguation.append({
+                        "qualified_name": qualified,
+                        "file": graph.translate_path(str(safe_get_attr(func, "filepath", ""))),
+                        "signature": format_function_signature(func),
+                    })
+                return truncate_response({
+                    "ambiguous": True,
+                    "message": (
+                        f"Multiple symbols named '{symbol_name}' found. "
+                        f"Use 'ClassName.method_name' syntax to disambiguate."
+                    ),
+                    "matches": disambiguation,
                 })
-            return truncate_response({
-                "ambiguous": True,
-                "message": (
-                    f"Multiple symbols named '{symbol_name}' found. "
-                    f"Use 'ClassName.method_name' syntax to disambiguate."
-                ),
-                "matches": disambiguation,
-            })
 
-        symbol_result = graph.get_symbol(symbol_name)
-        if symbol_result is None:
-            suggestions = _suggest_alternatives(graph, symbol_name)
-            msg = f"Symbol '{symbol_name}' not found."
-            if suggestions:
-                msg += " Did you mean: " + ", ".join(suggestions)
-            return {"found": False, "message": msg, "suggestions": suggestions}
+            symbol_result = graph.get_symbol(symbol_name)
+            if symbol_result is None:
+                suggestions = _suggest_alternatives(graph, symbol_name)
+                msg = f"Symbol '{symbol_name}' not found."
+                if suggestions:
+                    msg += " Did you mean: " + ", ".join(suggestions)
+                return {"found": False, "message": msg, "suggestions": suggestions}
 
-        lang, symbol, kind = symbol_result
+            lang, symbol, kind = symbol_result
 
         context = {
             "symbol": symbol_name,

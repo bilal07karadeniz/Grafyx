@@ -35,7 +35,11 @@ state through self: self._graph, self._source_index, self._stem_match(), etc.
 
 from __future__ import annotations
 
+import logging
+
 from grafyx.search._tokens import _tokenize_source
+
+logger = logging.getLogger(__name__)
 
 
 class SourceIndexMixin:
@@ -56,6 +60,7 @@ class SourceIndexMixin:
         _source_symbols: list[(name, file_path, class_name)] -- ordered by index
         _source_index: dict[token, set[int]] -- inverted index (pruned)
         _source_symbol_tokens: dict[int, set[str]] -- per-function token sets
+        _source_symbol_sources: dict[int, str] -- per-function source code (for M3 filtering)
         _source_symbol_lookup: dict[(name, file), int] -- reverse lookup
         _file_source_tokens: dict[path_suffix, set[str]] -- per-file tokens (pre-pruning)
     """
@@ -83,12 +88,14 @@ class SourceIndexMixin:
         symbols: list[tuple[str, str, str]] = []  # (name, file, class_name)
         raw_index: dict[str, set[int]] = {}
         symbol_tokens: dict[int, set[str]] = {}  # per-function token sets
+        symbol_sources: dict[int, str] = {}  # per-function source code (for M3)
 
         for name, fpath, source, cls_name in self._graph.iter_functions_with_source():
             if not source:
                 continue
             idx = len(symbols)
             symbols.append((name, fpath, cls_name))
+            symbol_sources[idx] = source
             # Deduplicate tokens per function -- we care about presence, not frequency
             seen_tokens: set[str] = set()
             for tok in _tokenize_source(source):
@@ -114,6 +121,7 @@ class SourceIndexMixin:
             self._source_index = {}
         self._source_symbols = symbols
         self._source_symbol_tokens = symbol_tokens
+        self._source_symbol_sources = symbol_sources
 
         # --- Reverse lookup for fast per-function scoring ---
         # Used by _source_score_for() to quickly check if a specific function
@@ -206,28 +214,76 @@ class SourceIndexMixin:
                     )
             # Stem fallback: try matching against index keys when exact match fails.
             # 0.7x weight because stem matches are less precise than exact matches.
+            # Sort keys for deterministic results across graph refreshes.
             else:
-                for index_tok, indices in self._source_index.items():
+                for index_tok in sorted(self._source_index):
                     if self._stem_match(tok, index_tok):
-                        for idx in indices:
+                        for idx in self._source_index[index_tok]:
                             matched_weight_per_candidate[idx] = (
                                 matched_weight_per_candidate.get(idx, 0.0) + w * 0.7
                             )
                         break  # Take first stem match only to avoid explosion
 
-        # Score = matched_weight / total_weight, capped at 0.70.
-        # Minimum threshold of 0.25 filters out very weak matches.
+        # Score = matched_weight / total_weight, capped at 0.82.
+        # Cap raised from 0.70 to let multi-token source matches outscore
+        # mediocre name-only matches (e.g. function with "daily"+"transport"
+        # in its body should rank above a weak 1/5-token name hit).
+        # Minimum threshold of 0.15 allows single high-IDF-token matches
+        # (e.g., "jwt" with weight 0.6 in a 2-token query).
         results: list[tuple[str, str, str, float]] = []
         for idx, matched_w in matched_weight_per_candidate.items():
-            score = min(0.70, matched_w / total_weight)
-            if score > 0.25:
+            score = min(0.82, matched_w / total_weight)
+            if score > 0.10:
                 name, fpath, cls_name = self._source_symbols[idx]
                 results.append((name, fpath, cls_name, score))
 
         results.sort(key=lambda x: x[3], reverse=True)
-        return results[:max_results]
+
+        # Apply M3 source token quality filter to top candidates.
+        # M3 involves regex parsing per-token, so limit to 2x max_results.
+        # Tokens appearing only in imports/strings/__getattr__ get reduced
+        # weight, which can demote false-positive source matches.
+        top = results[:max_results * 2]
+        rescored: list[tuple[str, str, str, float]] = []
+        for name, fpath, cls_name, raw_score in top:
+            idx = getattr(self, "_source_symbol_lookup", {}).get((name, fpath))
+            if idx is None:
+                rescored.append((name, fpath, cls_name, raw_score))
+                continue
+            m3_weights = self._get_m3_token_weights(idx, query_tokens)
+            if not m3_weights:
+                rescored.append((name, fpath, cls_name, raw_score))
+                continue
+            # Average M3 quality across matched query tokens
+            func_tokens = self._source_symbol_tokens.get(idx, set())
+            matched_m3: list[float] = []
+            for tok in query_tokens:
+                if tok in func_tokens:
+                    matched_m3.append(m3_weights.get(tok, 1.0))
+            if matched_m3:
+                avg_quality = sum(matched_m3) / len(matched_m3)
+                new_score = raw_score * avg_quality
+                if new_score > 0.10:
+                    rescored.append((name, fpath, cls_name, new_score))
+            else:
+                rescored.append((name, fpath, cls_name, raw_score))
+        rescored.sort(key=lambda x: x[3], reverse=True)
+        return rescored[:max_results]
 
     # --- Single-Function Source Scoring ---
+
+    def _get_source_tokens(self, name: str, file_path: str) -> set[str] | None:
+        """Get source tokens for a specific function, or None if unavailable."""
+        if self._source_index is None:
+            return None
+        lookup = getattr(self, "_source_symbol_lookup", None)
+        if lookup is None:
+            return None
+        idx = lookup.get((name, file_path))
+        if idx is None:
+            return None
+        tokens = self._source_symbol_tokens.get(idx)
+        return tokens if tokens else None
 
     def _source_score_for(
         self,
@@ -246,6 +302,10 @@ class SourceIndexMixin:
 
         Unlike _source_search() which scans the full index, this method does
         a fast O(1) lookup for a specific (name, file_path) pair.
+
+        When the M3 source token filter is available, each matched token is
+        weighted by P(semantically relevant) -- tokens in imports, string
+        literals, or __getattr__ bodies get reduced weight.
 
         Substring containment (qt in ft or ft in qt) is also checked with a
         0.5x weight discount for tokens >= 4 chars.  This catches partial
@@ -267,12 +327,41 @@ class SourceIndexMixin:
         if not func_tokens:
             return 0.0
 
+        # M3 source token quality filtering
+        m3_weights = self._get_m3_token_weights(idx, query_tokens)
+
         total_weight = sum(token_weights.get(qt, 1.0) for qt in query_tokens) or 1.0
         hit_weight = 0.0
         for qt in query_tokens:
+            m3_w = m3_weights.get(qt, 1.0) if m3_weights else 1.0
             if qt in func_tokens:
-                hit_weight += token_weights.get(qt, 1.0)
+                hit_weight += token_weights.get(qt, 1.0) * m3_w
             # Substring containment for longer tokens (>= 4 chars to avoid noise)
             elif any(qt in ft or ft in qt for ft in func_tokens if len(ft) >= 4):
-                hit_weight += token_weights.get(qt, 1.0) * 0.5
+                hit_weight += token_weights.get(qt, 1.0) * 0.5 * m3_w
         return hit_weight / total_weight
+
+    def _get_m3_token_weights(
+        self, idx: int, query_tokens: list[str],
+    ) -> dict[str, float] | None:
+        """Get M3 source token filter weights for a function's tokens.
+
+        Returns {token: relevance_weight} or None if M3 is not available.
+        """
+        try:
+            from grafyx.search._source_filter import filter_source_tokens
+        except ImportError:
+            return None
+
+        sources = getattr(self, "_source_symbol_sources", None)
+        if sources is None:
+            return None
+        source = sources.get(idx)
+        if not source:
+            return None
+
+        name, fpath, _cls = self._source_symbols[idx]
+        try:
+            return filter_source_tokens(query_tokens, name, source, fpath)
+        except Exception:
+            return None

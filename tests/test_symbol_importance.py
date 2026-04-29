@@ -210,6 +210,7 @@ class TestScoreSymbolImportance:
 
     def test_fallback_uses_counts(self):
         """Without M4 model, should use caller + import count heuristic."""
+        from unittest.mock import patch
         graph = _make_mock_graph(
             caller_index={
                 "process_order": [
@@ -221,12 +222,14 @@ class TestScoreSymbolImportance:
                 "orders.py": ["routes.py", "jobs.py", "tests.py"],
             },
         )
-        score = _score_symbol_importance("process_order", "orders.py", "function", graph)
+        with patch("grafyx.ml_inference.get_model", return_value=None):
+            score = _score_symbol_importance("process_order", "orders.py", "function", graph)
         # (2 callers + 3 importers) / 50.0 = 0.10
         assert abs(score - 0.10) < 1e-6
 
     def test_fallback_capped_at_one(self):
         """Heuristic score should be capped at 1.0."""
+        from unittest.mock import patch
         graph = _make_mock_graph(
             caller_index={
                 "core": [{"name": f"c{i}", "file": f"f{i}.py"} for i in range(40)],
@@ -235,14 +238,17 @@ class TestScoreSymbolImportance:
                 "core.py": [f"mod_{i}.py" for i in range(20)],
             },
         )
-        score = _score_symbol_importance("core", "core.py", "function", graph)
+        with patch("grafyx.ml_inference.get_model", return_value=None):
+            score = _score_symbol_importance("core", "core.py", "function", graph)
         # (40 + 20) / 50.0 = 1.2, should be capped at 1.0
         assert score == 1.0
 
     def test_fallback_zero_for_isolated_symbol(self):
         """Isolated symbols with no callers or importers should score 0."""
+        from unittest.mock import patch
         graph = _make_mock_graph()
-        score = _score_symbol_importance("orphan_func", "orphan.py", "function", graph)
+        with patch("grafyx.ml_inference.get_model", return_value=None):
+            score = _score_symbol_importance("orphan_func", "orphan.py", "function", graph)
         assert score == 0.0
 
     def test_returns_float(self):

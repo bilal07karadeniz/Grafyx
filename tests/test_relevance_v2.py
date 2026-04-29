@@ -107,10 +107,26 @@ class TestRelevanceV2Features:
 class TestRelevanceScorerV1Fallback:
     """Test that RelevanceScorer falls back to v1 weights gracefully."""
 
+    def _make_v1_scorer(self):
+        """Create a scorer that forces v1 fallback by hiding v2 weights."""
+        import os
+        from unittest.mock import patch
+        from grafyx.search._relevance import RelevanceScorer
+
+        _real_exists = os.path.exists
+
+        def _hide_v2(path):
+            if "relevance_weights_v2" in str(path):
+                return False
+            return _real_exists(path)
+
+        with patch("os.path.exists", side_effect=_hide_v2):
+            return RelevanceScorer()
+
     def test_v1_weights_still_work(self):
         """v1 weights file loads and produces valid scores."""
-        from grafyx.search._relevance import RelevanceScorer
-        scorer = RelevanceScorer()
+        scorer = self._make_v1_scorer()
+        assert scorer._version == 1
         result = scorer.score(
             ["auth", "user"], "auth user", "authenticate_user",
             "Authenticate a user", "app/auth.py"
@@ -119,8 +135,7 @@ class TestRelevanceScorerV1Fallback:
 
     def test_v1_truncates_features(self):
         """When using v1 model, features are truncated to 33."""
-        from grafyx.search._relevance import RelevanceScorer
-        scorer = RelevanceScorer()
+        scorer = self._make_v1_scorer()
         assert scorer._version == 1
         # Scorer should still work with v2 params passed
         result = scorer.score(

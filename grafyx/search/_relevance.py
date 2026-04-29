@@ -42,11 +42,18 @@ def _stem_match(a: str, b: str) -> bool:
     shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
     if len(shorter) < 4:
         return False
-    if longer.startswith(shorter):
+    if len(longer) - len(shorter) > 3:
+        # Words differ by 4+ chars → not morphological variants
+        # Blocks: "embed"→"embedding" (diff=4), "config"→"configuration" (diff=7)
+        # The relaxed Latin-root check below still handles long-word pairs.
+        pass
+    elif longer.startswith(shorter):
         return True
-    min_prefix = max(4, len(shorter) - 1)
-    if min_prefix <= len(longer) and longer[:min_prefix] == shorter[:min_prefix]:
-        return True
+    else:
+        # Shared prefix check for -e dropping: "store"→"storing" share "stor"
+        min_prefix = max(4, len(shorter) - 1)
+        if min_prefix <= len(longer) and longer[:min_prefix] == shorter[:min_prefix]:
+            return True
     if len(shorter) >= 7 and len(longer) >= 7:
         shared = 0
         for c1, c2 in zip(shorter, longer):
@@ -386,6 +393,24 @@ def ml_score_match(
         embedding_similarity=embedding_similarity,
         caller_count_normalized=caller_count_normalized,
     )
+
+    # Compound match bonus — when consecutive query tokens match
+    # consecutive name tokens, it's a phrase match ("rate limiting"
+    # -> "rateLimit") which is much stronger than scattered single hits.
+    if len(query_tokens) >= 2:
+        name_tokens = _split_tokens(name)
+        if len(name_tokens) >= 2:
+            consecutive = 0
+            for i in range(len(query_tokens) - 1):
+                qt1, qt2 = query_tokens[i], query_tokens[i + 1]
+                for j in range(len(name_tokens) - 1):
+                    nt1, nt2 = name_tokens[j], name_tokens[j + 1]
+                    if (qt1 == nt1 or _stem_match(qt1, nt1)) and \
+                       (qt2 == nt2 or _stem_match(qt2, nt2)):
+                        consecutive += 1
+                        break
+            if consecutive > 0:
+                raw = min(1.0, raw + consecutive * 0.12)
 
     # Gibberish token penalty — when >50% of query tokens have no
     # symbol presence (IDF weight <= 0.3), dampen scores proportionally.

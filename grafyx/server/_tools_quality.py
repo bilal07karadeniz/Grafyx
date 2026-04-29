@@ -9,8 +9,6 @@ This module groups five tools focused on codebase health and maintenance:
   when the file watcher hasn't caught up or after bulk changes.
 - **get_unused_symbols** (Tool 11) -- dead code detection.  Finds
   functions and classes with zero inbound references.
-- **get_circular_dependencies** (Tool 12) -- finds import cycles that
-  could cause runtime ImportError or indicate tight coupling.
 - **get_subclasses** (Tool 13) -- recursively finds all subclasses of a
   given class, useful for understanding the blast radius of interface
   changes.
@@ -18,6 +16,7 @@ This module groups five tools focused on codebase health and maintenance:
 Registered on the shared ``mcp`` instance from ``_state.py``.
 """
 
+import threading
 import time
 from typing import Any
 
@@ -26,6 +25,76 @@ from fastmcp.exceptions import ToolError
 from grafyx.server import _state
 from grafyx.server._state import _ensure_initialized, mcp
 from grafyx.utils import truncate_response
+
+
+# --- Tool: set_project ---
+
+
+@mcp.tool
+def set_project(project_path: str) -> dict:
+    """Set or change the project directory that Grafyx analyzes.
+
+    Call this when Grafyx reports 'No project loaded' — typically when
+    running as a global MCP server.  Pass the workspace root path.
+
+    After calling this, all other Grafyx tools will work on the specified
+    project.  Re-call with a different path to switch projects.
+
+    Args:
+        project_path: Absolute path to the project root directory.
+    """
+    import re
+    from grafyx.server._state import (
+        _background_init, _find_project_root,
+        _server_languages, _server_ignore, _server_watch,
+    )
+
+    # Translate Windows paths to WSL paths (e.g. C:\foo\bar → /mnt/c/foo/bar)
+    p = project_path.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", p):
+        p = f"/mnt/{p[0].lower()}/{p[3:]}"
+    project_path = p
+
+    root = _find_project_root(project_path)
+    if root is None:
+        raise ToolError(
+            f"'{project_path}' is not a project directory "
+            f"(no .git, pyproject.toml, package.json, etc.)."
+        )
+
+    # Reset state for re-initialization
+    _state._graph = None
+    _state._searcher = None
+    _state._detector = None
+    _state._init_ready = False
+    _state._init_error = None
+
+    if _state._watcher is not None:
+        try:
+            _state._watcher.stop()
+        except Exception:
+            pass
+        _state._watcher = None
+
+    # Start background init for the new project
+    _state._init_thread = threading.Thread(
+        target=_background_init,
+        args=(root, _server_languages, _server_ignore, _server_watch),
+        daemon=True,
+    )
+    _state._init_thread.start()
+
+    # Wait for init to complete (up to 120s)
+    _state._wait_for_init()
+
+    if _state._init_error:
+        raise ToolError(f"Initialization failed: {_state._init_error}")
+
+    return {
+        "status": "initialized",
+        "project_path": root,
+        "stats": _state._graph.get_stats() if _state._graph else {},
+    }
 
 
 # --- Tool 8: get_conventions ---
@@ -137,8 +206,13 @@ def get_unused_symbols(
                 include_tests=include_tests,
                 max_results=max_results,
             )
-            result["unused_functions"] = unused_funcs
-            result["unused_function_count"] = len(unused_funcs)
+            genuinely_unused = [f for f in unused_funcs if not f.get("re_exported")]
+            exported_uncalled = [f for f in unused_funcs if f.get("re_exported")]
+            result["unused_functions"] = genuinely_unused
+            result["unused_function_count"] = len(genuinely_unused)
+            if exported_uncalled:
+                result["exported_but_uncalled"] = exported_uncalled
+                result["exported_but_uncalled_count"] = len(exported_uncalled)
 
         # --- Unused classes ---
         # Similar approach: checks usages, import index, and subclass
@@ -164,84 +238,20 @@ def get_unused_symbols(
                 parts.append(f"{result['unused_function_count']} functions/methods")
             if "unused_class_count" in result:
                 parts.append(f"{result['unused_class_count']} classes")
-            result["summary"] = f"Found {total} potentially unused symbols: {', '.join(parts)}."
+            summary = f"Found {total} potentially unused symbols: {', '.join(parts)}."
+            exported_count = result.get("exported_but_uncalled_count", 0)
+            if exported_count:
+                summary += (
+                    f" Additionally, {exported_count} symbols are re-exported "
+                    f"via __init__.py/index but have no internal callers."
+                )
+            result["summary"] = summary
 
         return truncate_response(result)
     except ToolError:
         raise
     except Exception as e:
         raise ToolError(f"Error in get_unused_symbols: {e}")
-
-
-# --- Tool 12: get_circular_dependencies ---
-
-
-@mcp.tool
-def get_circular_dependencies(
-    include_tests: bool = False,
-    max_chain_length: int = 10,
-) -> dict:
-    """Find circular import chains in the codebase.
-
-    Detects files that form import cycles (A imports B, B imports A),
-    including transitive cycles (A -> B -> C -> A).
-
-    Circular imports can cause ImportError at runtime, make code harder
-    to reason about, and indicate architectural coupling that should
-    be refactored.
-
-    Args:
-        include_tests: If True, include test files in analysis.
-        max_chain_length: Maximum cycle length to report.
-    """
-    graph = _ensure_initialized()
-    try:
-        # graph.find_import_cycles() uses DFS on the _forward_import_index
-        # to detect all cycles up to max_chain_length.
-        cycles = graph.find_import_cycles(max_chain_length=max_chain_length)
-
-        # Filter out test-only cycles unless explicitly requested.
-        # A cycle where ALL files are tests is usually harmless (test
-        # helpers importing each other).
-        if not include_tests:
-            cycles = [
-                c for c in cycles
-                if not all(graph._is_test_path(f) for f in c[:-1])
-            ]
-
-        # Translate internal mirror paths back to user-facing paths.
-        # Each cycle is a list like [A, B, C, A] where the last element
-        # repeats the first to show the cycle completes.
-        translated_cycles = []
-        for cycle in cycles:
-            translated = [graph.translate_path(f) for f in cycle]
-            translated_cycles.append({
-                "chain": translated,
-                "length": len(translated) - 1,  # Subtract 1 because last == first
-                # Deduplicated list of unique files in the cycle
-                "files_involved": list(dict.fromkeys(translated[:-1])),
-            })
-
-        result: dict[str, Any] = {
-            "cycles": translated_cycles,
-            "cycle_count": len(translated_cycles),
-            "include_tests": include_tests,
-        }
-
-        if not translated_cycles:
-            result["summary"] = "No circular import dependencies detected."
-        else:
-            lengths = [c["length"] for c in translated_cycles]
-            result["summary"] = (
-                f"Found {len(translated_cycles)} circular import chain(s). "
-                f"Shortest: {min(lengths)} files, longest: {max(lengths)} files."
-            )
-
-        return truncate_response(result)
-    except ToolError:
-        raise
-    except Exception as e:
-        raise ToolError(f"Error in get_circular_dependencies: {e}")
 
 
 # --- Tool 13: get_subclasses ---
@@ -263,7 +273,7 @@ def get_subclasses(class_name: str, depth: int = 3) -> dict:
         # nested tree of {class_name, file, subclasses: [...]}.
         result = graph.get_subclasses(class_name, depth)
         if result is None:
-            raise ToolError(f"Class '{class_name}' not found in the codebase.")
+            return {"found": False, "message": f"Class '{class_name}' not found in the codebase."}
         return truncate_response(result)
     except ToolError:
         raise

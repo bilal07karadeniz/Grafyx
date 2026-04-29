@@ -109,7 +109,8 @@ class IndexBuilderMixin:
 
     Writes to: _caller_index, _class_method_names, _file_class_methods,
     _class_defined_in, _import_index, _forward_import_index,
-    _external_packages, _class_instances, _file_symbol_imports
+    _external_packages, _class_instances, _file_symbol_imports,
+    _convention_import_sources, _convention_decorator_info
     """
 
     # ===================================================================
@@ -146,6 +147,11 @@ class IndexBuilderMixin:
         class_methods: dict[str, set[str]] = {}
         file_class_meths: dict[str, dict[str, set[str]]] = {}
         class_defined_in: dict[str, set[str]] = {}
+        # Convention cache: collect decorator info during this iteration
+        # so ConventionDetector doesn't need to re-iterate graph-sitter.
+        # Structure: {lang: {decorator_name: (count, [examples])}}
+        conv_decorators: dict[str, dict[str, tuple[int, list[str]]]] = {}
+        conv_method_counts: dict[str, int] = {}  # lang -> total methods
         # NOTE: Callers (initialize/refresh) already hold self._lock,
         # but RLock permits re-entrant acquisition for safety.
         with self._lock:
@@ -178,6 +184,26 @@ class IndexBuilderMixin:
                                 m_name = safe_get_attr(method, "name", "")
                                 if m_name:
                                     method_names.add(m_name)
+                                # Collect decorator info for convention detection
+                                conv_method_counts[lang] = conv_method_counts.get(lang, 0) + 1
+                                decorators = safe_get_attr(method, "decorators", [])
+                                if decorators:
+                                    for d in decorators:
+                                        d_str = safe_str(d).strip("@").split("(")[0]
+                                        if not d_str:
+                                            continue
+                                        if lang not in conv_decorators:
+                                            conv_decorators[lang] = {}
+                                        entry = conv_decorators[lang].get(d_str)
+                                        if entry is None:
+                                            label = f"{cls_name}.{m_name}" if cls_name else m_name
+                                            conv_decorators[lang][d_str] = (1, [label])
+                                        else:
+                                            count, examples = entry
+                                            if len(examples) < 3:
+                                                label = f"{cls_name}.{m_name}" if cls_name else m_name
+                                                examples.append(label)
+                                            conv_decorators[lang][d_str] = (count + 1, examples)
                             if cls_name and method_names:
                                 class_methods[cls_name] = method_names
                                 if cls_file:
@@ -190,6 +216,8 @@ class IndexBuilderMixin:
             self._class_method_names = class_methods
             self._file_class_methods = file_class_meths
             self._class_defined_in = class_defined_in
+            self._convention_decorator_info = conv_decorators
+            self._convention_method_counts = conv_method_counts
         logger.debug("Caller index built: %d entries, %d classes, %d files indexed",
                      len(index), len(class_methods), len(file_class_meths))
 
@@ -203,6 +231,8 @@ class IndexBuilderMixin:
         self._augment_index_with_celery_tasks()
         # Pass 5: infer method targets from unique method names
         self._augment_index_with_unique_method_calls()
+        # Pass 6: detect framework registration and property references
+        self._augment_index_with_framework_refs()
 
     # --- Pass 2: Dependency Injection / Callback Pattern Augmentation ---
 
@@ -341,10 +371,11 @@ class IndexBuilderMixin:
     def _augment_index_with_local_var_types(self) -> None:
         """Scan function bodies for local variable type assignments (Pass 3 of 3).
 
-        Detects three patterns that reveal the type of a local variable:
+        Detects four patterns that reveal the type of a local variable:
             - ``param: ClassName = ...``  (typed parameter, incl. FastAPI Depends)
             - ``var = ClassName(...)``     (local instantiation)
             - ``var: ClassName = ...``     (typed local variable)
+            - ``var = factory_func(...)``  (factory with return type annotation)
 
         When the function body calls ``var.method()``, adds a synthetic caller
         entry for ``ClassName.method`` in ``_caller_index`` with
@@ -354,10 +385,34 @@ class IndexBuilderMixin:
         This resolves false positives in dead code detection for:
             - FastAPI DI: ``service: EddyService = Depends(get_eddy_service)``
             - Local instantiation: ``executor = ToolExecutor(args)``
+            - Factory pattern: ``storage = get_storage_service()``
         """
         all_class_names: set[str] = set(self._class_method_names.keys())
         if not all_class_names:
             return
+
+        # Build factory function -> return class map from return type annotations.
+        # e.g., get_storage_service() -> S3StorageService means
+        # var = get_storage_service() → var is S3StorageService
+        factory_returns: dict[str, str] = {}
+        for _lang, codebase in self._codebases.items():
+            try:
+                for func in codebase.functions:
+                    fn = safe_get_attr(func, "name", "")
+                    if not fn:
+                        continue
+                    ret = safe_str(safe_get_attr(func, "return_type", ""))
+                    if not ret:
+                        continue
+                    # Extract class name from return type annotation.
+                    # Handles: "S3StorageService", "Optional[S3StorageService]",
+                    # "S3StorageService | None", "Type[S3StorageService]"
+                    for candidate in re.findall(r'[A-Z]\w+', ret):
+                        if candidate in all_class_names:
+                            factory_returns[fn] = candidate
+                            break
+            except Exception:
+                continue
 
         # Regex: typed param/local -- matches "word: ClassName =" or "word: ClassName,"
         # or "word: ClassName)". The ClassName must start with uppercase (convention
@@ -367,6 +422,8 @@ class IndexBuilderMixin:
         # Requires leading whitespace to avoid matching module-level assignments
         # (those are handled by _build_class_instances instead).
         assign_re = re.compile(r'^[ \t]+(\w+)\s*=\s*([A-Z]\w*)\s*\(', re.MULTILINE)
+        # Regex: factory call -- matches indented "var = func_name(" for factory functions
+        factory_re = re.compile(r'^[ \t]+(\w+)\s*=\s*(\w+)\s*\(', re.MULTILINE)
         # Regex: method call -- matches "var.method(" to find calls on typed locals
         method_call_re = re.compile(r'\b(\w+)\.(\w+)\s*\(')
         skip_vars = {"self", "cls"}
@@ -379,8 +436,8 @@ class IndexBuilderMixin:
                     if self._is_ignored_file_path(f_file):
                         continue
                     additions += self._scan_local_var_types(
-                        func, None, all_class_names,
-                        typed_re, assign_re, method_call_re, skip_vars,
+                        func, None, all_class_names, factory_returns,
+                        typed_re, assign_re, factory_re, method_call_re, skip_vars,
                     )
                 for cls in codebase.classes:
                     cls_file = self.translate_path(str(safe_get_attr(cls, "filepath", "")))
@@ -389,8 +446,8 @@ class IndexBuilderMixin:
                     cls_name = safe_get_attr(cls, "name", "")
                     for method in safe_get_attr(cls, "methods", []):
                         additions += self._scan_local_var_types(
-                            method, cls_name, all_class_names,
-                            typed_re, assign_re, method_call_re, skip_vars,
+                            method, cls_name, all_class_names, factory_returns,
+                            typed_re, assign_re, factory_re, method_call_re, skip_vars,
                         )
             except Exception as e:
                 logger.debug("Error scanning local var types for %s: %s", _lang, e)
@@ -402,16 +459,19 @@ class IndexBuilderMixin:
         func: Any,
         caller_class: str | None,
         all_class_names: set[str],
+        factory_returns: dict[str, str],
         typed_re: re.Pattern,
         assign_re: re.Pattern,
+        factory_re: re.Pattern,
         method_call_re: re.Pattern,
         skip_vars: set[str],
     ) -> int:
         """Scan a single function for local variable type assignments.
 
-        Builds a ``var_name -> ClassName`` map from type annotations and
-        instantiations, then matches ``var.method()`` calls to add
-        ``_trusted`` caller entries. Returns the number of entries added.
+        Builds a ``var_name -> ClassName`` map from type annotations,
+        instantiations, and factory function return types, then matches
+        ``var.method()`` calls to add ``_trusted`` caller entries.
+        Returns the number of entries added.
         """
         caller_name = safe_get_attr(func, "name", "")
         if not caller_name:
@@ -435,6 +495,17 @@ class IndexBuilderMixin:
             var_name, cls_name = m.group(1), m.group(2)
             if var_name not in skip_vars and cls_name in all_class_names:
                 var_types[var_name] = cls_name
+
+        # 3. Factory call: var = get_storage_service()
+        # If factory_func has return type -> ClassName, infer var's type
+        if factory_returns:
+            for m in factory_re.finditer(source):
+                var_name, func_name = m.group(1), m.group(2)
+                if var_name in skip_vars or var_name in var_types:
+                    continue
+                ret_cls = factory_returns.get(func_name)
+                if ret_cls:
+                    var_types[var_name] = ret_cls
 
         if not var_types:
             return 0
@@ -789,6 +860,535 @@ class IndexBuilderMixin:
                 additions += 1
         return additions
 
+    # --- Pass 6: Framework Registration & Property Reference Detection ---
+
+    def _augment_index_with_framework_refs(self) -> None:
+        """Detect function references in framework registration patterns (Pass 6).
+
+        Catches patterns that graph-sitter's function_calls miss:
+        - Fastify/Express: app.decorate('name', handler), app.use(handler)
+        - Array/object refs: { preHandler: [app.authenticate] }
+        - Timer/event callbacks: setInterval(func, n)
+        """
+        known_functions: set[str] = set()
+        for _lang, codebase in self._codebases.items():
+            try:
+                for func in codebase.functions:
+                    name = safe_get_attr(func, "name", "")
+                    if name and len(name) >= 4:
+                        known_functions.add(name)
+                for cls in codebase.classes:
+                    for method in safe_get_attr(cls, "methods", []):
+                        name = safe_get_attr(method, "name", "")
+                        if name and len(name) >= 4:
+                            known_functions.add(name)
+            except Exception:
+                continue
+
+        if not known_functions:
+            return
+
+        # Also collect known class names for JSX detection
+        known_classes: set[str] = set()
+        for _lang2, codebase2 in self._codebases.items():
+            try:
+                for cls in codebase2.classes:
+                    name = safe_get_attr(cls, "name", "")
+                    if name and len(name) >= 4:
+                        known_classes.add(name)
+            except Exception:
+                continue
+
+        # Pattern 1: string-based registration
+        # app.decorate('authenticate', handler), register('name', handler)
+        register_re = re.compile(
+            r"""(?:decorate|register|use)\s*\(\s*['"](\w{4,})['"]\s*,\s*(\w{4,})"""
+        )
+        # Pattern 2: array element references (functions passed in arrays)
+        # [app.authenticate, validate] or [authenticate, validate]
+        array_ref_re = re.compile(r'[\[,]\s*(?:\w+\.)?(\w{4,})\s*(?=[,\]])')
+        # Pattern 3: object property value that is a known function
+        # { handler: authenticate, preHandler: validate }
+        prop_ref_re = re.compile(r':\s*(?:\w+\.)?(\w{4,})\s*[,}\n]')
+        # Pattern 4: JSX component usage
+        # <AgentSettings ...>, <VoiceVideo />, <MessageContent text={...}/>
+        jsx_re = re.compile(r'<\s*([A-Z]\w{3,})[\s/>]')
+        known_jsx = known_functions | known_classes
+
+        additions = 0
+        for _lang, codebase in self._codebases.items():
+            try:
+                for func in codebase.functions:
+                    additions += self._scan_framework_refs(
+                        func, None, known_functions,
+                        register_re, array_ref_re, prop_ref_re,
+                        jsx_re, known_jsx,
+                    )
+                for cls in codebase.classes:
+                    cls_name = safe_get_attr(cls, "name", "")
+                    cls_file = self.translate_path(
+                        str(safe_get_attr(cls, "filepath", ""))
+                    )
+                    if self._is_ignored_file_path(cls_file):
+                        continue
+                    for method in safe_get_attr(cls, "methods", []):
+                        additions += self._scan_framework_refs(
+                            method, cls_name, known_functions,
+                            register_re, array_ref_re, prop_ref_re,
+                            jsx_re, known_jsx,
+                        )
+            except Exception as e:
+                logger.debug("Error in framework ref scan for %s: %s", _lang, e)
+        if additions:
+            logger.debug("Framework reference scan added %d caller entries", additions)
+
+    def _scan_framework_refs(
+        self,
+        func: Any,
+        caller_class: str | None,
+        known_functions: set[str],
+        register_re: re.Pattern,
+        array_ref_re: re.Pattern,
+        prop_ref_re: re.Pattern,
+        jsx_re: re.Pattern | None = None,
+        known_jsx: set[str] | None = None,
+    ) -> int:
+        """Scan a single function for framework registration and JSX patterns."""
+        caller_name = safe_get_attr(func, "name", "")
+        if not caller_name:
+            return 0
+        caller_file = self.translate_path(str(safe_get_attr(func, "filepath", "")))
+        if self._is_ignored_file_path(caller_file):
+            return 0
+        source = safe_str(safe_get_attr(func, "source", ""))
+        if not source:
+            return 0
+
+        found_refs: set[str] = set()
+
+        for m in register_re.finditer(source):
+            for g in (m.group(1), m.group(2)):
+                if g in known_functions and g != caller_name:
+                    found_refs.add(g)
+
+        for m in array_ref_re.finditer(source):
+            ref = m.group(1)
+            if ref in known_functions and ref != caller_name:
+                found_refs.add(ref)
+
+        for m in prop_ref_re.finditer(source):
+            ref = m.group(1)
+            if ref in known_functions and ref != caller_name:
+                found_refs.add(ref)
+
+        # JSX component usage: <AgentSettings .../>, <VoiceVideo>
+        if jsx_re and known_jsx:
+            for m in jsx_re.finditer(source):
+                ref = m.group(1)
+                if ref in known_jsx and ref != caller_name:
+                    found_refs.add(ref)
+
+        additions = 0
+        for ref_name in found_refs:
+            if ref_name not in self._caller_index:
+                self._caller_index[ref_name] = []
+            entry: dict[str, Any] = {
+                "name": caller_name,
+                "file": caller_file,
+                "_trusted": True,
+            }
+            if caller_class:
+                entry["class"] = caller_class
+            if not any(
+                e["name"] == caller_name and e["file"] == caller_file
+                for e in self._caller_index[ref_name]
+            ):
+                self._caller_index[ref_name].append(entry)
+                additions += 1
+        return additions
+
+    # --- Pass 7: Import-Disambiguated Method Calls ---
+
+    def _augment_index_with_import_disambiguated_calls(self) -> None:
+        """Resolve method calls using the import graph (Pass 7).
+
+        For ``var.method()`` calls where ``method`` is defined in 1+
+        classes, check which of those classes the calling file actually
+        imports.  If exactly one candidate class is imported, link the
+        call to that class with ``_trusted=True``.
+
+        Handles methods in ANY number of classes (not just ambiguous ones):
+        - 1 class:  Acts as safety net for Pass 5 (unique-method heuristic)
+                    which may miss calls where the variable name is in skip_vars.
+        - 2-5:     Core disambiguation — resolve by checking imports.
+        - 6+:      Skipped (too many candidates = high false positive risk).
+
+        This pass MUST run after ``_build_import_index()`` because it
+        reads ``_file_symbol_imports``.
+
+        Example: ``storage.upload_file()`` in a file that imports
+        ``S3StorageService`` (but not ``LocalStorageService``) is
+        resolved to ``S3StorageService.upload_file``.
+        """
+        # Build method -> [class_names] for all non-dunder methods
+        method_to_classes: dict[str, list[str]] = {}
+        for cls_name, methods in self._class_method_names.items():
+            for m in methods:
+                if m.startswith("__"):
+                    continue
+                if m not in method_to_classes:
+                    method_to_classes[m] = []
+                method_to_classes[m].append(cls_name)
+
+        # Include methods in 1-5 classes.  Single-class methods are
+        # mostly handled by Pass 5, but Pass 7 catches cases Pass 5
+        # missed (e.g., variable name was in skip_vars).
+        disambiguable_methods: dict[str, list[str]] = {
+            m: classes
+            for m, classes in method_to_classes.items()
+            if 1 <= len(classes) <= 5
+        }
+        if not disambiguable_methods:
+            return
+
+        # Build file -> set of imported symbol names (flat lookup).
+        # Also include imported module basenames so bare imports like
+        # `import services.storage` are tracked as "storage".
+        file_imports: dict[str, set[str]] = {}
+        for fpath, targets in self._file_symbol_imports.items():
+            names: set[str] = set()
+            for _target, sym_names in targets.items():
+                names.update(sym_names)
+            if names:
+                file_imports[fpath] = names
+        # Augment with class names from files in the import index:
+        # if file A imports file B which defines ClassX, add ClassX
+        # to file A's imported names.  This handles bare imports and
+        # `from module import *` patterns.
+        # Build reverse lookup: file_path → {class_names defined there}
+        file_to_classes: dict[str, set[str]] = {}
+        for cls_name, cls_files in self._class_defined_in.items():
+            for cf in cls_files:
+                if cf not in file_to_classes:
+                    file_to_classes[cf] = set()
+                file_to_classes[cf].add(cls_name)
+        for fpath, targets in self._file_symbol_imports.items():
+            for target_file in targets:
+                classes_in_target = file_to_classes.get(target_file)
+                if classes_in_target:
+                    if fpath not in file_imports:
+                        file_imports[fpath] = set()
+                    file_imports[fpath].update(classes_in_target)
+
+        method_call_re = re.compile(r'\b(\w+)\.(\w+)\s*\(')
+        skip_vars = {
+            "self", "cls", "super", "os", "sys", "re", "json", "math",
+            "logging", "logger", "log", "print", "str", "int", "float",
+            "list", "dict", "set", "tuple", "type", "object", "path",
+            "Path", "datetime", "date", "time", "uuid",
+        }
+
+        additions = 0
+        for _lang, codebase in self._codebases.items():
+            try:
+                for func in codebase.functions:
+                    additions += self._scan_import_disambiguated_calls(
+                        func, None, disambiguable_methods, file_imports,
+                        method_call_re, skip_vars,
+                    )
+                for cls in codebase.classes:
+                    cls_name = safe_get_attr(cls, "name", "")
+                    cls_file = self.translate_path(
+                        str(safe_get_attr(cls, "filepath", ""))
+                    )
+                    if self._is_ignored_file_path(cls_file):
+                        continue
+                    for method in safe_get_attr(cls, "methods", []):
+                        additions += self._scan_import_disambiguated_calls(
+                            method, cls_name, disambiguable_methods, file_imports,
+                            method_call_re, skip_vars,
+                        )
+            except Exception as e:
+                logger.debug("Error in import-disambiguated scan for %s: %s", _lang, e)
+        if additions:
+            logger.debug("Import-disambiguated method scan added %d caller entries", additions)
+
+    def _scan_import_disambiguated_calls(
+        self,
+        func: Any,
+        caller_class: str | None,
+        disambiguable_methods: dict[str, list[str]],
+        file_imports: dict[str, set[str]],
+        method_call_re: re.Pattern,
+        skip_vars: set[str],
+    ) -> int:
+        """Scan a function for method calls disambiguable by imports."""
+        caller_name = safe_get_attr(func, "name", "")
+        if not caller_name:
+            return 0
+        caller_file = self.translate_path(str(safe_get_attr(func, "filepath", "")))
+        if self._is_ignored_file_path(caller_file):
+            return 0
+        source = safe_str(safe_get_attr(func, "source", ""))
+        if not source:
+            return 0
+
+        imported_names = file_imports.get(caller_file, set())
+        if not imported_names:
+            return 0
+
+        additions = 0
+        for m in method_call_re.finditer(source):
+            var_name, method_name = m.group(1), m.group(2)
+            if var_name in skip_vars:
+                continue
+            candidate_classes = disambiguable_methods.get(method_name)
+            if not candidate_classes:
+                continue
+            # Skip if caller's own class is a candidate
+            if caller_class and caller_class in candidate_classes:
+                continue
+
+            # Check which candidate classes are imported by caller's file
+            matched = [c for c in candidate_classes if c in imported_names]
+            if len(matched) != 1:
+                continue  # 0 or 2+ → ambiguous
+
+            target_cls = matched[0]
+            if method_name not in self._caller_index:
+                self._caller_index[method_name] = []
+            entry: dict[str, Any] = {
+                "name": caller_name,
+                "file": caller_file,
+                "_trusted": True,
+            }
+            if caller_class:
+                entry["class"] = caller_class
+            if not any(
+                e["name"] == caller_name and e["file"] == caller_file
+                for e in self._caller_index[method_name]
+            ):
+                self._caller_index[method_name].append(entry)
+                additions += 1
+        return additions
+
+    # --- Pass 8: Object Literal Method Extraction ---
+
+    _TS_JS_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx"})
+
+    def _extract_object_literal_methods(self) -> None:
+        """Extract arrow function methods from TS/JS object literal exports (Pass 8).
+
+        Scans file source code for patterns like:
+            export const NAME = { method: () => ..., method: async () => ... }
+            const NAME = { method: (params) => ... }
+            export default { method: () => ... }
+
+        Uses brace-depth tracking (not regex) to find the extent of each
+        object literal, then scans for method entries at depth 1.
+
+        Stores results in ``_object_literal_methods`` for use by
+        ``iter_functions_with_source()`` and ``get_all_functions()``.
+        """
+        self._object_literal_methods = []
+
+        # Regex to find object literal assignments
+        # Matches: export const NAME = {  /  const NAME = {  /  export default {
+        obj_start_re = re.compile(
+            r'(?:export\s+)?(?:const|let|var)\s+(\w+)\s*[=:]\s*\{'
+            r'|export\s+default\s*\{'
+        )
+        # Regex to find method entries at depth 1 inside the object
+        # Matches: methodName: async (params) =>  /  methodName(params) {  /  methodName: (params) =>
+        method_re = re.compile(
+            r'(\w+)\s*:\s*(?:async\s+)?'
+            r'(?:\([^)]*\)\s*(?::\s*\w[\w\[\]<>, |]*\s*)?=>|\([^)]*\)\s*(?::\s*\w[\w\[\]<>, |]*\s*)?\{)'
+            r'|(\w+)\s*\([^)]*\)\s*(?::\s*\w[\w\[\]<>, |]*\s*)?\{'
+        )
+
+        for lang, codebase in self._codebases.items():
+            if lang not in ("typescript", "javascript"):
+                continue
+            try:
+                for f in codebase.files:
+                    file_path = self.translate_path(
+                        str(safe_get_attr(f, "path", safe_get_attr(f, "filepath", "")))
+                    )
+                    if self._is_ignored_file_path(file_path):
+                        continue
+                    # Check file extension
+                    if not any(file_path.endswith(ext) for ext in self._TS_JS_EXTENSIONS):
+                        continue
+                    source = safe_get_attr(f, "source", "")
+                    if not source:
+                        continue
+                    self._scan_object_literal_methods(
+                        source, file_path, lang, obj_start_re, method_re,
+                    )
+            except Exception as e:
+                logger.debug("Error extracting object literal methods for %s: %s", lang, e)
+
+        if self._object_literal_methods:
+            logger.debug(
+                "Pass 8: extracted %d object literal methods from TS/JS files",
+                len(self._object_literal_methods),
+            )
+
+    def _scan_object_literal_methods(
+        self,
+        source: str,
+        file_path: str,
+        language: str,
+        obj_start_re: re.Pattern,
+        method_re: re.Pattern,
+    ) -> None:
+        """Scan a single file's source for object literal method patterns."""
+        for m in obj_start_re.finditer(source):
+            parent_name = m.group(1) if m.group(1) else "default"
+            brace_start = m.end() - 1  # Position of the opening {
+
+            # Walk forward to find matching closing brace
+            obj_body_start = brace_start + 1
+            obj_body_end = self._find_matching_brace(source, brace_start)
+            if obj_body_end < 0:
+                continue  # Unmatched brace, skip
+
+            obj_body = source[obj_body_start:obj_body_end]
+
+            # Find methods at top level of this object (depth 0 within body)
+            for mm in method_re.finditer(obj_body):
+                method_name = mm.group(1) or mm.group(2)
+                if not method_name or method_name.startswith("_"):
+                    continue
+                # Skip common non-method keys
+                if method_name in ("type", "default", "required", "value", "key", "label"):
+                    continue
+
+                # Verify this match is at depth 0 within the object body
+                # by counting braces before this position
+                prefix = obj_body[:mm.start()]
+                depth = prefix.count("{") - prefix.count("}")
+                if depth != 0:
+                    continue
+
+                # Compute line number in the original file
+                abs_pos = obj_body_start + mm.start()
+                line_no = source[:abs_pos].count("\n") + 1
+
+                # Extract a short source snippet for the method
+                method_start = obj_body_start + mm.start()
+                method_source = self._extract_method_source(source, method_start)
+
+                self._object_literal_methods.append({
+                    "name": method_name,
+                    "parent": parent_name,
+                    "file": file_path,
+                    "line": line_no,
+                    "source": method_source,
+                    "language": language,
+                })
+
+    @staticmethod
+    def _find_matching_brace(source: str, open_pos: int) -> int:
+        """Find the position of the matching closing brace.
+
+        Args:
+            source: Full source text.
+            open_pos: Position of the opening '{'.
+
+        Returns:
+            Position of the matching '}', or -1 if not found.
+        """
+        depth = 0
+        in_string = None  # None, '"', "'", '`'
+        i = open_pos
+        length = len(source)
+        while i < length:
+            c = source[i]
+            if in_string:
+                if c == "\\" and i + 1 < length:
+                    i += 2  # Skip escaped character
+                    continue
+                if c == in_string:
+                    in_string = None
+            else:
+                if c in ('"', "'", "`"):
+                    in_string = c
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+                elif c == "/" and i + 1 < length:
+                    next_c = source[i + 1]
+                    if next_c == "/":
+                        # Single-line comment: skip to end of line
+                        nl = source.find("\n", i + 2)
+                        i = nl if nl >= 0 else length
+                        continue
+                    elif next_c == "*":
+                        # Block comment: skip to */
+                        end = source.find("*/", i + 2)
+                        i = end + 2 if end >= 0 else length
+                        continue
+            i += 1
+        return -1
+
+    @staticmethod
+    def _extract_method_source(source: str, start_pos: int) -> str:
+        """Extract source for a single method within an object literal.
+
+        Walks from the method name to the end of its body (matching braces
+        or arrow expression). Returns at most 500 chars.
+        """
+        # Find the arrow or opening brace
+        search_end = min(start_pos + 200, len(source))
+        snippet_start = start_pos
+        # Look for => or { after the parameter list
+        i = start_pos
+        brace_pos = -1
+        while i < search_end:
+            if source[i] == "{":
+                brace_pos = i
+                break
+            elif source[i:i+2] == "=>":
+                # Arrow function: find the body
+                j = i + 2
+                while j < len(source) and source[j] in " \t\n\r":
+                    j += 1
+                if j < len(source) and source[j] == "{":
+                    brace_pos = j
+                    break
+                else:
+                    # Expression arrow: find next comma or closing brace at depth 0
+                    end = j
+                    depth = 0
+                    while end < len(source):
+                        c = source[end]
+                        if c in ("(", "[", "{"):
+                            depth += 1
+                        elif c in (")", "]", "}"):
+                            if depth == 0:
+                                break
+                            depth -= 1
+                        elif c == "," and depth == 0:
+                            break
+                        end += 1
+                    result = source[snippet_start:end].strip()
+                    return result[:500]
+            i += 1
+
+        if brace_pos < 0:
+            return source[snippet_start:snippet_start + 200].strip()
+
+        # Find matching closing brace
+        close = IndexBuilderMixin._find_matching_brace(source, brace_pos)
+        if close < 0:
+            return source[snippet_start:brace_pos + 200].strip()[:500]
+        result = source[snippet_start:close + 1].strip()
+        return result[:500]
+
     # --- Primary Caller Index Helper ---
 
     def _index_calls_from(self, func: Any, index: dict[str, list[dict]]) -> None:
@@ -882,6 +1482,10 @@ class IndexBuilderMixin:
         index: dict[str, list[str]] = {}
         forward: dict[str, list[str]] = {}
         symbol_imports: dict[str, dict[str, set[str]]] = {}
+        # Convention cache: collect raw import source strings during this
+        # iteration so ConventionDetector doesn't re-iterate graph-sitter.
+        # Structure: [{source: str, file: str, language: str}, ...]
+        conv_imports: list[dict[str, str]] = []
         with self._lock:
             # Phase 1: Build suffix -> full_path lookup for O(1) resolution.
             # We prefer "path" over "filepath" because in some graph-sitter
@@ -953,12 +1557,24 @@ class IndexBuilderMixin:
                         if not imports:
                             continue
 
+                        # Dedupe set for convention import cache
+                        _conv_seen: set[str] = set()
                         for imp in imports:
                             imp_source = safe_str(safe_get_attr(imp, "source", ""))
                             if not imp_source:
                                 imp_source = safe_str(imp)
                             if not imp_source:
                                 continue
+
+                            # Cache for ConventionDetector (deduplicated by module)
+                            _conv_mod = imp_source.replace("from ", "").split(" import ")[0].strip()
+                            if _conv_mod and _conv_mod not in _conv_seen:
+                                _conv_seen.add(_conv_mod)
+                                conv_imports.append({
+                                    "source": imp_source,
+                                    "file": fpath,
+                                    "language": lang,
+                                })
 
                             module = self._extract_module_from_import(imp_source)
                             if not module:
@@ -1045,6 +1661,7 @@ class IndexBuilderMixin:
             self._import_index = index
             self._forward_import_index = forward
             self._file_symbol_imports = symbol_imports
+            self._convention_import_sources = conv_imports
             self._resolve_init_reexports()
         logger.debug("Import index built: %d reverse, %d forward, %d symbol-level entries",
                      len(self._import_index), len(self._forward_import_index),

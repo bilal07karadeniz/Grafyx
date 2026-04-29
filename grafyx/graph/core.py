@@ -11,7 +11,7 @@ The MRO (Method Resolution Order) composes five mixins:
     2. ``IndexBuilderMixin``  -- builds all reverse indexes from parsed codebases
     3. ``CallerQueryMixin``   -- multi-level caller disambiguation queries
     4. ``SymbolQueryMixin``   -- function/class/file/symbol lookups, stats
-    5. ``AnalysisMixin``      -- dead code, cycles, subclass trees, module deps
+    5. ``AnalysisMixin``      -- dead code detection, subclass trees
 
 All mixin state lives on ``self`` (the CodebaseGraph instance). The
 ``__init__`` method initializes all ``self._*`` attributes that the mixins
@@ -91,12 +91,19 @@ class CodebaseGraph(
         # --- Import indexes: file-level dependency graph (bidirectional) ---
         self._import_index: dict[str, list[str]] = {}           # target -> [importers] (reverse)
         self._forward_import_index: dict[str, list[str]] = {}   # source -> [imported] (forward)
-        self._top_level_forward_import_index: dict[str, list[str]] = {}  # source -> [imported] (top-level only)
         self._file_symbol_imports: dict[str, dict[str, set[str]]] = {}  # importer -> {target -> {names}}
 
         # --- Supporting indexes ---
         self._external_packages: set[str] = set()               # pip/npm/stdlib names to skip
         self._class_instances: dict[str, list[tuple[str, str]]] = {}  # class -> [(var_name, file)]
+
+        # --- Convention caches: collected during index building for ConventionDetector ---
+        self._convention_import_sources: list[dict[str, str]] = []
+        self._convention_decorator_info: dict[str, dict[str, tuple[int, list[str]]]] = {}
+        self._convention_method_counts: dict[str, int] = {}
+
+        # --- Object literal methods (TS/JS arrow functions in exports) ---
+        self._object_literal_methods: list[dict] = []
 
         # --- Lifecycle state ---
         self._init_errors: list[str] = []
@@ -181,6 +188,8 @@ class CodebaseGraph(
             self._build_caller_index()
             self._build_class_instances()
             self._build_import_index()
+            self._augment_index_with_import_disambiguated_calls()  # Pass 7
+            self._extract_object_literal_methods()  # Pass 8
             self._last_refresh_time = time.time()
             duration = time.time() - start
 
@@ -227,6 +236,8 @@ class CodebaseGraph(
             self._build_caller_index()
             self._build_class_instances()
             self._build_import_index()
+            self._augment_index_with_import_disambiguated_calls()  # Pass 7
+            self._extract_object_literal_methods()  # Pass 8
             self._last_refresh_time = time.time()
             duration = time.time() - start
 

@@ -23,8 +23,8 @@ Architecture overview::
     _tools_structure.py  <-- Tool 1:  get_project_skeleton
     _tools_introspection.py  <-- Tools 2-4: function / file / class context
     _tools_search.py     <-- Tools 5-6: find_related_code / find_related_files
-    _tools_graph.py      <-- Tools 7, 9, 14: dependency graph / call graph / module deps
-    _tools_quality.py    <-- Tools 8, 10-13: conventions, refresh, unused, cycles, subclasses
+    _tools_graph.py      <-- Tools 7, 9: dependency graph / call graph
+    _tools_quality.py    <-- Tools 8, 10-11, 13: conventions, refresh, unused, subclasses
 """
 
 # --- Core server state and helpers ---
@@ -65,10 +65,8 @@ from grafyx.server._tools_search import (  # noqa: F401
 from grafyx.server._tools_graph import (  # noqa: F401
     get_call_graph,
     get_dependency_graph,
-    get_module_dependencies,
 )
 from grafyx.server._tools_quality import (  # noqa: F401
-    get_circular_dependencies,
     get_conventions,
     get_subclasses,
     get_unused_symbols,
@@ -90,10 +88,8 @@ __all__ = [
     "find_related_files",
     "get_dependency_graph",
     "get_call_graph",
-    "get_module_dependencies",
     "get_conventions",
     "get_unused_symbols",
-    "get_circular_dependencies",
     "get_subclasses",
     "refresh_graph",
 ]

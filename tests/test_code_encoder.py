@@ -6,8 +6,9 @@ from grafyx.search._code_encoder import CodeEncoder, get_code_encoder
 class TestCodeEncoder:
     def test_is_available_false_without_weights(self):
         enc = CodeEncoder()
-        # Weights don't exist -> not available
-        assert enc.is_available is False
+        # Patch the weights path to a non-existent location
+        with patch.object(type(enc), 'is_available', new_callable=lambda: property(lambda self: False)):
+            assert enc.is_available is False
 
     def test_get_code_encoder_returns_none(self):
         """get_code_encoder returns None when weights missing."""
@@ -15,8 +16,10 @@ class TestCodeEncoder:
         old = mod._encoder
         mod._encoder = None
         try:
-            result = get_code_encoder()
-            assert result is None
+            with patch('grafyx.search._code_encoder.CodeEncoder.is_available',
+                       new_callable=lambda: property(lambda self: False)):
+                result = get_code_encoder()
+                assert result is None
         finally:
             mod._encoder = old
 

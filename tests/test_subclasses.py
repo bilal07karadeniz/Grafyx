@@ -115,6 +115,6 @@ class TestGetSubclassesTool:
         mock_graph.get_subclasses.return_value = None
 
         from grafyx.server import get_subclasses
-        from fastmcp.exceptions import ToolError
-        with pytest.raises(ToolError, match="not found"):
-            call_tool(get_subclasses,class_name="Nonexistent")
+        result = call_tool(get_subclasses, class_name="Nonexistent")
+        assert result["found"] is False
+        assert "not found" in result["message"].lower()

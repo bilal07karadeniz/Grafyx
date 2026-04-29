@@ -8,7 +8,7 @@ import logging
 import numpy as np
 from pathlib import Path
 
-from grafyx.search._mamba import MambaBlock, _layer_norm
+from grafyx.search._mamba import MambaBlock, FeedForwardBlock, _layer_norm
 from grafyx.search._tokenizer import CodeTokenizer
 
 logger = logging.getLogger(__name__)
@@ -52,43 +52,56 @@ class CodeEncoder:
         self._token_embedding = data["token_embedding"]
         self._pos_embedding = data["pos_embedding"]
 
-        # Load Mamba blocks
+        # Load sequence blocks (auto-detect Mamba vs FeedForward)
         i = 0
         while f"layer_{i}_norm.weight" in data:
             prefix = f"layer_{i}_"
-            block_weights = {
-                "norm_w": data[f"{prefix}norm.weight"],
-                "norm_b": data[f"{prefix}norm.bias"],
-                "in_proj_w": data.get(
-                    f"{prefix}mamba.in_proj.weight", np.zeros((1, 1))
-                ).T,
-                "in_proj_b": data.get(
-                    f"{prefix}mamba.in_proj.bias", np.zeros(1)
-                ),
-                "A_log": data.get(
-                    f"{prefix}mamba.A_log", np.zeros((1, 1))
-                ),
-                "D": data.get(f"{prefix}mamba.D", np.ones(1)),
-                "dt_proj_w": data.get(
-                    f"{prefix}mamba.dt_proj.weight", np.zeros((1, 1))
-                ).T,
-                "dt_proj_b": data.get(
-                    f"{prefix}mamba.dt_proj.bias", np.zeros(1)
-                ),
-                "B_proj_w": data.get(
-                    f"{prefix}mamba.B_proj.weight", np.zeros((1, 1))
-                ).T,
-                "C_proj_w": data.get(
-                    f"{prefix}mamba.C_proj.weight", np.zeros((1, 1))
-                ).T,
-                "out_proj_w": data.get(
-                    f"{prefix}mamba.out_proj.weight", np.zeros((1, 1))
-                ).T,
-                "out_proj_b": data.get(
-                    f"{prefix}mamba.out_proj.bias", np.zeros(1)
-                ),
-            }
-            self._blocks.append(MambaBlock(block_weights))
+            is_ff = f"{prefix}ff.w1" in data
+
+            if is_ff:
+                block_weights = {
+                    "norm_w": data[f"{prefix}norm.weight"],
+                    "norm_b": data[f"{prefix}norm.bias"],
+                    "ff_w1": data[f"{prefix}ff.w1"],
+                    "ff_b1": data[f"{prefix}ff.b1"],
+                    "ff_w2": data[f"{prefix}ff.w2"],
+                    "ff_b2": data[f"{prefix}ff.b2"],
+                }
+                self._blocks.append(FeedForwardBlock(block_weights))
+            else:
+                block_weights = {
+                    "norm_w": data[f"{prefix}norm.weight"],
+                    "norm_b": data[f"{prefix}norm.bias"],
+                    "in_proj_w": data.get(
+                        f"{prefix}mamba.in_proj.weight", np.zeros((1, 1))
+                    ).T,
+                    "in_proj_b": data.get(
+                        f"{prefix}mamba.in_proj.bias", np.zeros(1)
+                    ),
+                    "A_log": data.get(
+                        f"{prefix}mamba.A_log", np.zeros((1, 1))
+                    ),
+                    "D": data.get(f"{prefix}mamba.D", np.ones(1)),
+                    "dt_proj_w": data.get(
+                        f"{prefix}mamba.dt_proj.weight", np.zeros((1, 1))
+                    ).T,
+                    "dt_proj_b": data.get(
+                        f"{prefix}mamba.dt_proj.bias", np.zeros(1)
+                    ),
+                    "B_proj_w": data.get(
+                        f"{prefix}mamba.B_proj.weight", np.zeros((1, 1))
+                    ).T,
+                    "C_proj_w": data.get(
+                        f"{prefix}mamba.C_proj.weight", np.zeros((1, 1))
+                    ).T,
+                    "out_proj_w": data.get(
+                        f"{prefix}mamba.out_proj.weight", np.zeros((1, 1))
+                    ).T,
+                    "out_proj_b": data.get(
+                        f"{prefix}mamba.out_proj.bias", np.zeros(1)
+                    ),
+                }
+                self._blocks.append(MambaBlock(block_weights))
             i += 1
 
         # Final norm + projection
@@ -99,13 +112,16 @@ class CodeEncoder:
 
         self._loaded = True
 
-    def encode(self, text: str, max_length: int = 256) -> np.ndarray:
+    def encode(self, text: str, max_length: int = 0) -> np.ndarray:
         """Encode text to embedding vector.
 
         Returns:
             L2-normalized embedding vector (embed_dim,).
         """
         self._ensure_loaded()
+        # Auto-detect max_length from position embedding size
+        if max_length <= 0:
+            max_length = self._pos_embedding.shape[0]
         token_ids = self._tokenizer.encode(text, max_length=max_length)
 
         # Token + positional embedding

@@ -134,7 +134,30 @@ class CallerQueryMixin:
         """
         with self._lock:
             callers = list(self._caller_index.get(function_name, []))
-            if not class_name or not callers:
+            if not callers:
+                return []
+            if not class_name:
+                # Check if this name is also used as a method.
+                # Two detection paths:
+                #  1. Known codebase class method (in _class_method_names)
+                #  2. External library method (e.g. SQLAlchemy Session.refresh):
+                #     detected when >80% of callers use dot syntax, indicating
+                #     the name is primarily called as obj.method().
+                is_also_method = any(
+                    function_name in meths
+                    for meths in self._class_method_names.values()
+                )
+                if not is_also_method and len(callers) >= 3:
+                    dot_count = sum(
+                        1 for c in callers if c.get("_has_dot_syntax", False)
+                    )
+                    is_also_method = dot_count / len(callers) >= 0.8
+                if is_also_method:
+                    callers = [
+                        c for c in callers
+                        if not c.get("_has_dot_syntax", False)
+                        or c.get("_trusted", False)
+                    ]
                 return [_format_caller_output(c) for c in callers]
 
             # --- Try ML disambiguation first (M2 Caller Disambiguator) ---

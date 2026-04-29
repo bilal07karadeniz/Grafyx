@@ -39,6 +39,8 @@ Lifecycle::
 """
 
 import logging
+import os
+import sys
 import threading
 import time
 
@@ -64,10 +66,46 @@ _searcher: CodeSearcher | None = None
 _detector: ConventionDetector | None = None
 _watcher: CodebaseWatcher | None = None
 _init_ready = False  # Set True after background initialization completes
+_init_error: str | None = None  # Set if background init fails
+_init_thread: threading.Thread | None = None  # Reference to background init thread
+
+# Saved server config for set_project / deferred init
+_server_languages: list[str] | None = None
+_server_ignore: list[str] | None = None
+_server_watch: bool = True
 
 # The single FastMCP instance that all tool modules register on.
 # Created at module-load time so @mcp.tool decorators work immediately.
 mcp = FastMCP("Grafyx")
+
+# ---------------------------------------------------------------------------
+# Project markers — files that indicate a directory is a project root
+# ---------------------------------------------------------------------------
+_PROJECT_MARKERS = (
+    ".git", "pyproject.toml", "setup.py", "setup.cfg",
+    "package.json", "Cargo.toml", "go.mod", "pom.xml",
+    "Makefile", "CMakeLists.txt", ".hg", ".svn",
+)
+
+
+def _is_project_dir(path: str) -> bool:
+    """Check if a directory looks like a project root."""
+    return any(os.path.exists(os.path.join(path, m)) for m in _PROJECT_MARKERS)
+
+
+def _find_project_root(start: str) -> str | None:
+    """Walk up from start looking for a project root. Returns None if not found."""
+    path = os.path.abspath(start)
+    if _is_project_dir(path):
+        return path
+    parent = path
+    for _ in range(10):
+        parent = os.path.dirname(parent)
+        if parent == os.path.dirname(parent):
+            break
+        if _is_project_dir(parent):
+            return parent
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +143,26 @@ def _find_reference_lines(file_path: str, name: str, max_lines: int = 3) -> list
         return []
 
 
+def _progress(msg: str) -> None:
+    """Write progress to stderr (always visible in MCP client logs)."""
+    print(f"[grafyx] {msg}", file=sys.stderr, flush=True)
+
+
+def _silence_graph_sitter() -> None:
+    """Suppress all graph_sitter loggers to prevent stdout pollution."""
+    _OFF = logging.CRITICAL + 1
+    for name in list(logging.Logger.manager.loggerDict):
+        if "graph_sitter" in name:
+            lgr = logging.getLogger(name)
+            lgr.handlers.clear()
+            lgr.setLevel(_OFF)
+            lgr.propagate = False
+    gs = logging.getLogger("graph_sitter")
+    gs.handlers.clear()
+    gs.setLevel(_OFF)
+    gs.propagate = False
+
+
 # ---------------------------------------------------------------------------
 # Initialization helpers
 # ---------------------------------------------------------------------------
@@ -130,42 +188,89 @@ def _background_init(
         4. Start CodebaseWatcher (file-system watcher for incremental updates)
         5. Set _init_ready flag (unblocks all waiting tool calls)
     """
-    global _graph, _searcher, _detector, _watcher, _init_ready
+    global _graph, _searcher, _detector, _watcher, _init_ready, _init_error
 
-    logger.info("Initializing Grafyx for %s", project_path)
-    _graph = CodebaseGraph(
-        project_path,
-        languages=languages,
-        ignore_patterns=ignore_patterns,
-    )
-    init_result = _graph.initialize()
-    logger.info("Graph initialized: %s", init_result)
+    try:
+        # Lower thread priority so graph parsing doesn't starve the system.
+        # nice(10) is a mild deprioritization — still finishes fast but
+        # won't pin CPU at 95% on single/dual-core machines.
+        try:
+            os.nice(10)
+        except (OSError, AttributeError):
+            pass  # Windows or permission denied — no-op
 
-    _searcher = CodeSearcher(_graph)
-    _detector = ConventionDetector(_graph)
+        abs_path = os.path.abspath(project_path)
+        _progress(f"Initializing for: {abs_path}")
 
-    if watch:
-        _watcher = CodebaseWatcher(_graph)
-        _watcher.start()
-        logger.info("File watcher started")
+        # Validate project path
+        root = _find_project_root(abs_path)
+        if root is None:
+            raise RuntimeError(
+                f"'{abs_path}' is not a project directory "
+                f"(no .git, pyproject.toml, package.json, etc.). "
+                f"Use --project /path/to/project or run grafyx "
+                f"from within a project directory."
+            )
+        if root != abs_path:
+            project_path = root
+            _progress(f"Auto-detected project root: {root}")
 
-    # Signal that all state is ready.  Tools blocked in _wait_for_init()
-    # will see this on their next polling iteration.
-    _init_ready = True
-    logger.info("Grafyx ready")
+        # Silence graph_sitter BEFORE it creates any loggers during init
+        _silence_graph_sitter()
+
+        _progress("Building graph...")
+        _graph = CodebaseGraph(
+            project_path,
+            languages=languages,
+            ignore_patterns=ignore_patterns,
+        )
+        init_result = _graph.initialize()
+        _progress(f"Graph ready: {init_result}")
+
+        # Silence again — build_graph() creates new child loggers lazily
+        _silence_graph_sitter()
+
+        _progress("Building search index...")
+        _searcher = CodeSearcher(_graph)
+        _progress("Detecting conventions...")
+        _detector = ConventionDetector(_graph)
+
+        # Only start watcher if the project is on native Linux.
+        # When using a mirror (~/.grafyx/mirrors/...), the watcher would
+        # watch the mirror — not the original project — so it can never
+        # detect real file changes.  Skip it to save CPU.
+        if watch and _graph.project_path == _graph.original_path:
+            _watcher = CodebaseWatcher(_graph)
+            _watcher.start()
+            _progress("File watcher started")
+        elif watch:
+            _progress("Skipping file watcher (mirror mode — use refresh_graph to update)")
+
+        _init_ready = True
+        _progress("Grafyx ready")
+    except BaseException as e:
+        _init_error = f"{type(e).__name__}: {e}"
+        _init_ready = True  # Unblock waiters so they get the error
+        _progress(f"Initialization FAILED: {_init_error}")
 
 
 def _wait_for_init(timeout: float = 120.0) -> None:
     """Block until background initialization is complete.
 
-    Polls ``_init_ready`` every 200 ms.  If the timeout is exceeded,
-    raises a ToolError so the MCP client gets a useful error message
-    rather than hanging forever.
+    Polls ``_init_ready`` every 200 ms.  If the timeout is exceeded or the
+    init thread dies unexpectedly, raises a ToolError so the MCP client
+    gets a useful error message rather than hanging forever.
     """
     deadline = time.monotonic() + timeout
     while not _init_ready:
         if time.monotonic() > deadline:
             raise ToolError("Grafyx is still initializing. Please try again in a moment.")
+        # Detect if the init thread crashed without setting _init_ready
+        if _init_thread is not None and not _init_thread.is_alive() and not _init_ready:
+            raise ToolError(
+                "Grafyx initialization thread died unexpectedly. "
+                "Check stderr/MCP logs for details."
+            )
         time.sleep(0.2)
 
 
@@ -197,18 +302,35 @@ def create_server(
             timeout.  Tools block until init finishes via
             ``_ensure_initialized()``.
     """
-    if lazy:
-        # Start heavy work in a daemon thread so the MCP transport layer
-        # can respond to the handshake while parsing is still running.
-        thread = threading.Thread(
-            target=_background_init,
-            args=(project_path, languages, ignore_patterns, watch),
-            daemon=True,
-        )
-        thread.start()
+    global _init_thread, _server_languages, _server_ignore, _server_watch
+
+    # Save config for set_project
+    _server_languages = languages
+    _server_ignore = ignore_patterns
+    _server_watch = watch
+
+    # Check if the project path is a valid project
+    abs_path = os.path.abspath(project_path)
+    root = _find_project_root(abs_path)
+
+    if root is not None:
+        # Valid project — initialize immediately or in background
+        if lazy:
+            _init_thread = threading.Thread(
+                target=_background_init,
+                args=(root, languages, ignore_patterns, watch),
+                daemon=True,
+            )
+            _init_thread.start()
+        else:
+            _background_init(root, languages, ignore_patterns, watch)
     else:
-        # Synchronous init -- useful for tests and small projects.
-        _background_init(project_path, languages, ignore_patterns, watch)
+        # No project detected — server starts but tools will prompt
+        # the AI to call set_project() with the workspace path.
+        _progress(
+            f"No project at '{abs_path}'. "
+            f"Waiting for set_project() call."
+        )
 
     return mcp
 
@@ -232,8 +354,16 @@ def _ensure_initialized() -> CodebaseGraph:
     Raises:
         ToolError: If initialization timed out or the graph is not available.
     """
+    if not _init_ready and _init_thread is None:
+        # No init started — server is waiting for set_project
+        raise ToolError(
+            "No project loaded. Call set_project with the workspace "
+            "root path first (e.g. set_project(project_path='/path/to/project'))."
+        )
     if not _init_ready:
         _wait_for_init()
+    if _init_error:
+        raise ToolError(f"Grafyx initialization failed: {_init_error}")
     if _graph is None or not _graph.initialized:
         raise ToolError("Grafyx not initialized. Server may have failed to start.")
     return _graph

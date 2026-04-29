@@ -44,6 +44,9 @@ grafyx = "grafyx.__main__:main"
 [tool.hatch.build.targets.wheel]
 packages = ["grafyx"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [project.urls]
 Homepage = "https://github.com/bilal07karadeniz/Grafyx"
 Repository = "https://github.com/bilal07karadeniz/Grafyx"

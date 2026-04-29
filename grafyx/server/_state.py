@@ -74,9 +74,58 @@ _server_languages: list[str] | None = None
 _server_ignore: list[str] | None = None
 _server_watch: bool = True
 
+# Usage instructions injected into every connected client's system prompt.
+# Captures hard-won lessons about when this MCP helps vs. when it can mislead.
+# See https://modelcontextprotocol.io for how clients surface server instructions.
+GRAFYX_INSTRUCTIONS = """\
+Grafyx provides 14 pre-indexed tools for codebase navigation: call graphs, dependency maps, symbol lookups. Use these tools instead of grep when working with existing code — they are faster and structurally aware. But Grafyx is not a 100% replacement for reading source. Verify when results look thin.
+
+## When to use Grafyx
+
+Always use BEFORE modifying existing code:
+- get_function_context or get_class_context before editing any function/class
+- get_call_graph before refactoring (to see what will break)
+- get_file_context before editing any file (to understand imports and dependents)
+- get_subclasses before changing a base class interface
+
+Use for exploration:
+- get_project_skeleton when starting work on an unfamiliar area
+- get_module_context to understand a directory/package
+- find_related_code to find where a concept lives by description
+- get_unused_symbols when cleaning up dead code
+
+Use for safety checks:
+- get_dependency_graph to check blast radius before changes
+- get_call_graph depth=2 to trace execution flow
+
+## When NOT to use Grafyx
+
+- Simple single-file edits where context is already clear
+- Creating brand new files
+- Config / env / build-tooling changes
+
+## Known limitations (verify before trusting)
+
+- TypeScript object literal methods (`const api = { fn: () => ... }`) sometimes show as 0 functions. Read the file source instead of trusting function count.
+- find_related_files can miss important files. If results look incomplete, fall back to grep.
+- Python analysis is highly accurate. TypeScript analysis is good but verify caller counts for React components.
+- Celery `.delay()` and `.apply_async()` callers are NOT detected (dynamic dispatch through the task registry).
+- get_all_functions(include_methods=False) is the default — only returns top-level functions, not class methods.
+- ML relevance ranker (find_related_code) is a small MLP (42 features). Expect it to surface plausible-but-wrong matches on ambiguous queries; cross-check with get_function_context before acting.
+
+## Recommended workflow
+
+1. Before ANY code change: get_function_context on what you're about to modify
+2. Check callers — if callers > 0, understand the impact before editing
+3. Make the change
+4. Verify callers still work (run tests, or get_function_context again on the callers)
+
+If a tool returns suspicious or empty results, do NOT silently trust it — read the source file directly.
+"""
+
 # The single FastMCP instance that all tool modules register on.
 # Created at module-load time so @mcp.tool decorators work immediately.
-mcp = FastMCP("Grafyx")
+mcp = FastMCP("Grafyx", instructions=GRAFYX_INSTRUCTIONS)
 
 # ---------------------------------------------------------------------------
 # Project markers — files that indicate a directory is a project root

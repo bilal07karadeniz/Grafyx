@@ -1,5 +1,7 @@
 # Grafyx
 
+[![PyPI](https://img.shields.io/pypi/v/grafyx-mcp.svg)](https://pypi.org/project/grafyx-mcp/)
+[![CI](https://github.com/bilal07karadeniz/Grafyx/actions/workflows/ci.yml/badge.svg)](https://github.com/bilal07karadeniz/Grafyx/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io)
@@ -79,6 +81,10 @@ Add to `.vscode/mcp.json`:
 | `get_conventions` | Detected coding patterns and conventions |
 | `get_call_graph` | Call chain tracing upstream and downstream |
 | `refresh_graph` | Force re-parse of the codebase |
+| `get_module_context` | Symbols in a directory/package (intermediate zoom) |
+| `get_subclasses` | Inheritance tree for a base class |
+| `get_unused_symbols` | Dead code detection |
+| `set_project` | Switch the served project at runtime |
 
 ---
 
@@ -90,7 +96,7 @@ Your AI Assistant
        | MCP Protocol (stdio)
        v
   +-----------+
-  |  Grafyx   |  FastMCP server with 10 tools
+  |  Grafyx   |  FastMCP server with 14 tools
   |  Server   |
   +-----------+
        |
@@ -111,8 +117,20 @@ Your AI Assistant
 ```
 
 1. **Startup** -- Grafyx detects languages in your project and parses all source files into a semantic graph via Graph-sitter.
-2. **Serving** -- The FastMCP server exposes 10 tools over stdio. Your AI assistant calls them as needed.
+2. **Serving** -- The FastMCP server exposes 14 tools over stdio. Your AI assistant calls them as needed.
 3. **Live updates** -- Watchdog monitors file changes. When you save, the graph is automatically re-parsed after a short debounce.
+
+### ML-augmented search
+
+Grafyx ships several small numpy-only MLPs trained on real source data:
+
+- **M1 Relevance ranker** -- 33-feature MLP scores each search result against the query.
+- **M3 Source token filter** -- suppresses noise tokens (imports, strings, magic methods) from full-text search.
+- **M4 Symbol importance** -- weights symbols by caller count, exports, and structural signals.
+- **M5 Bi-encoder** -- semantic embedding model (BPE tokenizer, FeedForward encoder) for natural-language code search.
+- **Gibberish detector** -- character-bigram MLP that blocks nonsense queries before they hit the index.
+
+All weights ship inside the wheel (~11 MB total). Inference is pure numpy, no PyTorch at runtime.
 
 ---
 
@@ -158,8 +176,8 @@ Grafyx works with agent teams. A single Grafyx instance serves all agents connec
 ## Contributing
 
 ```bash
-git clone https://github.com/grafyx-ai/grafyx.git
-cd grafyx
+git clone https://github.com/bilal07karadeniz/Grafyx.git
+cd Grafyx
 pip install -e ".[dev]"
 pytest
 ```

@@ -31,3 +31,23 @@ _create_resolution.py
 _gen_test.py
 _test_b64.txt
 _write_test.py
+
+# IDE / editor
+.cursor/
+
+# ML training artifacts (never commit — multi-GB)
+ml/all_symbols.json
+ml/claude_training_pairs.json
+ml/llm_training_pairs.json
+ml/m5_*.json
+ml/m5_programmatic_pairs.json
+ml/m5_*.pt
+ml/.claude_batch_state.json
+ml/.repo_cache/
+
+# Generic ML data extensions
+*.pt
+*.ckpt
+
+# Developer-specific shell helpers
+grafyx_start.sh

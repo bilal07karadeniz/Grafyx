@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "MCP server that gives AI coding assistants real-time codebase understanding via Graph-sitter"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
+authors = [
+    {name = "Bilal Karadeniz", email = "bilal07karadeniz@gmail.com"},
+]
 keywords = ["mcp", "ai", "codebase", "graph", "tree-sitter", "code-analysis"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -20,7 +23,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "graph-sitter>=0.1.0",
+    "graph-sitter>=0.56.0",
     "fastmcp>=2.0.0",
     "watchdog>=4.0.0",
 ]
@@ -42,6 +45,6 @@ grafyx = "grafyx.__main__:main"
 packages = ["grafyx"]
 
 [project.urls]
-Homepage = "https://github.com/grafyx-ai/grafyx"
-Repository = "https://github.com/grafyx-ai/grafyx"
-Issues = "https://github.com/grafyx-ai/grafyx/issues"
+Homepage = "https://github.com/bilal07karadeniz/Grafyx"
+Repository = "https://github.com/bilal07karadeniz/Grafyx"
+Issues = "https://github.com/bilal07karadeniz/Grafyx/issues"

@@ -51,3 +51,8 @@ ml/.repo_cache/
 
 # Developer-specific shell helpers
 grafyx_start.sh
+
+# Benchmark harness — only scripts and pinned_commits.json are tracked
+benchmarks/repos/
+benchmarks/eval_data/
+benchmarks/results/

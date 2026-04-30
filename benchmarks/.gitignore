@@ -1,0 +1,6 @@
+*
+!.gitignore
+!README.md
+!pinned_commits.json
+!scripts/
+!scripts/**

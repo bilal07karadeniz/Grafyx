@@ -1,0 +1,14 @@
+{
+  "fastapi": {
+    "url": "https://github.com/tiangolo/fastapi.git",
+    "commit": "PIN_AT_FIRST_RUN"
+  },
+  "django": {
+    "url": "https://github.com/django/django.git",
+    "commit": "PIN_AT_FIRST_RUN"
+  },
+  "home-assistant": {
+    "url": "https://github.com/home-assistant/core.git",
+    "commit": "PIN_AT_FIRST_RUN"
+  }
+}

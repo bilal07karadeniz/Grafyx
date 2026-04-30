@@ -142,6 +142,22 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             return self._embedding_searcher.search_files(query, top_k=top_k)
         return []
 
+    @property
+    def encoder_meta(self) -> dict:
+        """Identify the active encoder for response metadata."""
+        if self._embedding_searcher is None:
+            return {"model": "none", "version": ""}
+        cfg = getattr(self._embedding_searcher, "_cfg", None)
+        if not cfg:
+            return {
+                "model": getattr(self._embedding_searcher, "_model_name", "unknown"),
+                "version": "",
+            }
+        return {
+            "model": cfg["id"],
+            "version": cfg.get("model_name", ""),
+        }
+
     def wait_for_index_ready(self, timeout: float = 600.0) -> bool:
         """Block until the embedding index has finished building.
 

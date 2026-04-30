@@ -20,6 +20,8 @@ involved.
 Registered on the shared ``mcp`` instance from ``_state.py``.
 """
 
+import time as _time
+
 from fastmcp.exceptions import ToolError
 
 from grafyx.server import _state
@@ -44,12 +46,16 @@ def find_related_code(description: str, max_results: int = 10) -> dict:
 
         # CodeSearcher.search() returns a list of dicts, each with:
         #   name, type (function/class/file), file, score, low_confidence
+        t0 = _time.perf_counter()
         results = _state._searcher.search(description, max_results=max_results)
+        latency_ms = (_time.perf_counter() - t0) * 1000.0
 
         response: dict = {
             "query": description,
             "results": results,
             "total_results": len(results),
+            "model": getattr(_state._searcher, "encoder_meta", {"model": "unknown", "version": ""}),
+            "latency_ms": round(latency_ms, 1),
         }
 
         # When the best match has low confidence, add a hint so the AI

@@ -15,9 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fastembed.add_custom_model` from a custom HF repo).
 - Published head-to-head encoder benchmark in
   [`docs/benchmarks/0.2.0/`](docs/benchmarks/0.2.0/) — 278 queries
-  across FastAPI + Django. jina-v2 wins by 12.4 nDCG@10 points
-  (0.787 vs 0.663 average); decision rationale, raw JSON, and per-query
-  JSONL all committed.
+  across FastAPI + Django, three encoders (tokens-only baseline,
+  jina-v2, coderankembed). jina-v2 wins by 12.4 nDCG@10 points
+  (0.787 vs 0.663) and is +135% over the tokens-only baseline (0.335).
+  Decision rationale, raw JSON, and per-query JSONL all committed.
+- New `--encoder tokens` mode in `bench_search.py` lets the harness
+  measure source-token search alone (the fallback when fastembed is
+  not installed).
 - Hosted ONNX-int8 mirror of CodeRankEmbed at
   [`Bilal7Dev/grafyx-coderankembed-onnx`](https://huggingface.co/Bilal7Dev/grafyx-coderankembed-onnx)
   so users opting in via `GRAFYX_ENCODER=coderankembed` get a

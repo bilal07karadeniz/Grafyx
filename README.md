@@ -134,6 +134,10 @@ calls. Install with `pip install grafyx-mcp[embeddings]`.
 |---|---:|---:|---:|
 | jina-v2 (default) | **0.787** | **0.741** | ~1.5 s |
 | coderankembed | 0.663 | 0.623 | ~1.3 s |
+| tokens-only (no fastembed) | 0.335 | 0.297 | ~0.9 s |
+
+The default encoder more than doubles retrieval quality over plain
+source-token search (+135% nDCG@10).
 
 Full breakdown + per-query JSONL: [`docs/benchmarks/0.2.0/`](docs/benchmarks/0.2.0/).
 

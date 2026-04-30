@@ -24,6 +24,12 @@
   },
   "results": {
     "fastapi": {
+      "tokens": {
+        "ndcg10_mean": 0.39318334617106176,
+        "mrr10_mean": 0.3346153846153846,
+        "latency_p50_ms": 487.6298439999971,
+        "n": 78
+      },
       "jina-v2": {
         "ndcg10_mean": 0.7703782977833853,
         "mrr10_mean": 0.7055555555555556,
@@ -38,6 +44,12 @@
       }
     },
     "django": {
+      "tokens": {
+        "ndcg10_mean": 0.27673987341188316,
+        "mrr10_mean": 0.25933333333333336,
+        "latency_p50_ms": 1268.4399964999784,
+        "n": 200
+      },
       "jina-v2": {
         "ndcg10_mean": 0.8033327389965621,
         "mrr10_mean": 0.7755833333333333,
@@ -53,6 +65,10 @@
     }
   },
   "averages_across_repos": {
+    "tokens": {
+      "ndcg10_mean": 0.33496160979147245,
+      "mrr10_mean": 0.296974358974359
+    },
     "jina-v2": {
       "ndcg10_mean": 0.7868555183899737,
       "mrr10_mean": 0.7405694444444445
@@ -61,6 +77,10 @@
       "ndcg10_mean": 0.6627695442676829,
       "mrr10_mean": 0.6225459401709402
     }
+  },
+  "encoder_uplift_over_tokens": {
+    "jina-v2": 1.349,
+    "coderankembed": 0.978
   },
   "selection_rule": "ship coderankembed as default if ndcg10 > jina-v2 by >= 0.03 absolute. otherwise ship jina-v2.",
   "decision": "jina-v2",

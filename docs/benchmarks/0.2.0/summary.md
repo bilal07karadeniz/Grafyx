@@ -17,12 +17,25 @@
 
 | Repo | Encoder | nDCG@10 | MRR@10 | p50 latency | n |
 |---|---|---:|---:|---:|---:|
-| FastAPI | **jina-v2** | **0.770** | **0.706** | 1058 ms | 78 |
+| FastAPI | tokens (no encoder) | 0.393 | 0.335 | 488 ms | 78 |
 | FastAPI | coderankembed | 0.721 | 0.672 | 885 ms | 78 |
-| Django | **jina-v2** | **0.803** | **0.776** | 1865 ms | 200 |
+| FastAPI | **jina-v2** | **0.770** | **0.706** | 1058 ms | 78 |
+| Django | tokens (no encoder) | 0.277 | 0.259 | 1268 ms | 200 |
 | Django | coderankembed | 0.605 | 0.573 | 1664 ms | 200 |
-| **Average** | **jina-v2** | **0.787** | **0.741** | — | 278 |
+| Django | **jina-v2** | **0.803** | **0.776** | 1865 ms | 200 |
+| **Average** | tokens (no encoder) | 0.335 | 0.297 | — | 278 |
 | **Average** | coderankembed | 0.663 | 0.623 | — | 278 |
+| **Average** | **jina-v2** | **0.787** | **0.741** | — | 278 |
+
+## Headline numbers
+
+- **jina-v2 vs tokens-only: +135% nDCG@10** (0.787 vs 0.335). The
+  semantic encoder more than doubles retrieval quality over plain
+  source-token search on docstring-style queries.
+- **jina-v2 vs CodeRankEmbed: +18.7%** (0.787 vs 0.663). 12.4 absolute
+  nDCG@10 points; the gap is widest on Django (19.9 pts).
+- **Latency cost of the encoder: +570 ms** at p50 on FastAPI, +597 ms
+  on Django. Worth it given the 2.3× quality lift.
 
 ## Decision
 
@@ -61,4 +74,3 @@ Per-query JSONL with raw rankings ships in `docs/benchmarks/0.2.0/per_query/`.
 
 1. **Home Assistant skipped this run.** Home Assistant has ~13K Python files, and the embedding build for that codebase needs ~30 min per encoder; running both encoders against it pushed past the bench harness's wall-clock budget for the alpha. The v0.2.0 GA benchmark will include it.
 2. **Bias toward docstring-language queries.** The eval set is the first sentence of each function's docstring, which is a *fair* test (encoder must map natural-language description → function name) but it favors models trained on doc-style retrieval. Real Grafyx queries from MCP clients tend to be terser ("auth middleware", "rate limit"). A second eval pass on hand-written terse queries is on the v0.2.0 GA roadmap.
-3. **No "no-encoder" baseline.** Token-only search (the fallback when fastembed isn't installed) wasn't measured — it would require a separate code path. The expected gap is large (encoder ~0.79 vs token ~0.3 historically), but we should publish the number rather than assume it for GA.

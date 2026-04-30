@@ -44,10 +44,14 @@ def _mrr_at_k(ranked: list[str], expected: str, k: int = 10) -> float:
 def _run_grafyx_encoder(repo_path: Path, queries: list[dict], encoder: str) -> list[dict]:
     """Spin up Grafyx against the repo and run each query through find_related_code.
 
-    encoder: "m5" | "jina-v2" | "coderankembed" — controls which encoder backend
-    Grafyx uses (set via env var GRAFYX_ENCODER, read by EmbeddingSearcher in Task 7).
+    encoder values:
+        "tokens"        — disable fastembed entirely, source-token search only
+                          (the baseline you'd get without the embeddings extra)
+        "jina-v2"       — fastembed-native sentence encoder (default)
+        "coderankembed" — custom-registered ONNX encoder
     """
-    os.environ["GRAFYX_ENCODER"] = encoder
+    if encoder != "tokens":
+        os.environ["GRAFYX_ENCODER"] = encoder
     from grafyx.graph import CodebaseGraph
     from grafyx.search.searcher import CodeSearcher
 
@@ -57,6 +61,12 @@ def _run_grafyx_encoder(repo_path: Path, queries: list[dict], encoder: str) -> l
           f"{init_stats.get('total_classes', 0)} cls, "
           f"{init_stats.get('duration_seconds', 0):.1f}s")
     searcher = CodeSearcher(graph)
+
+    if encoder == "tokens":
+        # Force the no-embedding fallback path. wait_for_index_ready will
+        # short-circuit because _embedding_searcher is None.
+        searcher._embedding_init_done = True
+        searcher._embedding_searcher = None
     # Block on encoder build — for benchmarking we want a warm index.
     # Bumped to 1800 s so large repos (Home Assistant ~13k Python files)
     # don't return uninitialized embeddings.
@@ -116,11 +126,11 @@ def run(encoders: list[str], repos: list[str] | None = None) -> dict:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--encoder", default="m5",
-                        choices=["m5", "jina-v2", "coderankembed", "all"])
+    parser.add_argument("--encoder", default="jina-v2",
+                        choices=["tokens", "jina-v2", "coderankembed", "all"])
     parser.add_argument("--repos", default=None,
                         help="Comma-separated subset of pinned repos (default: all)")
     args = parser.parse_args()
-    encs = ["m5", "jina-v2", "coderankembed"] if args.encoder == "all" else [args.encoder]
+    encs = ["tokens", "jina-v2", "coderankembed"] if args.encoder == "all" else [args.encoder]
     repos = [r.strip() for r in args.repos.split(",")] if args.repos else None
     run(encs, repos=repos)

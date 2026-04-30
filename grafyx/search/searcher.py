@@ -415,24 +415,6 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                             language="",
                         ))
 
-            # M5 Mamba bi-encoder search (if available)
-            try:
-                from grafyx.search._code_encoder import get_code_encoder
-                code_encoder = get_code_encoder()
-                if code_encoder is not None:
-                    m5_hits = code_encoder.search(query, top_k=30)
-                    for e_name, e_file, e_score in m5_hits:
-                        key = (e_name, e_file)
-                        if key not in result_keys_src and e_score > 0.22:
-                            result_keys_src.add(key)
-                            func_results.append(SearchResult(
-                                name=e_name, kind="function", file_path=e_file,
-                                score=e_score, context=f"{e_name}  [semantic match]",
-                                language="",
-                            ))
-            except ImportError:
-                pass
-
             # Re-sort and re-merge with all engines' results
             func_results.sort(key=lambda r: r.score, reverse=True)
             merged = _merge_results(

@@ -4,3 +4,7 @@
 !pinned_commits.json
 !scripts/
 !scripts/**
+
+# Re-exclude common Python noise inside scripts/
+scripts/**/__pycache__/
+scripts/**/*.pyc

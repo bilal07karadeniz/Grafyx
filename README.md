@@ -1,12 +1,14 @@
 # Grafyx
 
-[![PyPI](https://img.shields.io/pypi/v/grafyx-mcp.svg)](https://pypi.org/project/grafyx-mcp/)
+[![PyPI](https://img.shields.io/pypi/v/grafyx-mcp.svg?v=0.2.0)](https://pypi.org/project/grafyx-mcp/)
 [![CI](https://github.com/bilal07karadeniz/Grafyx/actions/workflows/ci.yml/badge.svg)](https://github.com/bilal07karadeniz/Grafyx/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/protocol-MCP-green.svg)](https://modelcontextprotocol.io)
 
 **Real-time codebase understanding for AI coding assistants.**
+
+> Latest release: **v0.2.0** — semantic encoder (jina-v2) is now the default for `find_related_code` (+135% nDCG@10 over token search). See [CHANGELOG](CHANGELOG.md) and [0.2.0 benchmark](docs/benchmarks/0.2.0/summary.md).
 
 ---
 

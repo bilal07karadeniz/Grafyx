@@ -142,6 +142,24 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             return self._embedding_searcher.search_files(query, top_k=top_k)
         return []
 
+    def wait_for_index_ready(self, timeout: float = 600.0) -> bool:
+        """Block until the embedding index has finished building.
+
+        Used by the benchmark harness to ensure a warm index before timing
+        queries. Returns False on timeout, True on ready (or no embeddings
+        configured, in which case there is nothing to wait for).
+        """
+        import time as _time
+        self._ensure_embeddings()
+        if self._embedding_searcher is None:
+            return True
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if self._embedding_searcher._ready:
+                return True
+            _time.sleep(0.5)
+        return False
+
     # --- Main Symbol Search ---
 
     def search(

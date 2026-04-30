@@ -122,15 +122,33 @@ Your AI Assistant
 
 ### ML-augmented search
 
-Grafyx ships several small numpy-only MLPs trained on real source data:
+Grafyx's `find_related_code` uses a pretrained code embedding model (default:
+`jinaai/jina-embeddings-v2-base-code`, Apache-2.0, 161M params) running on CPU
+via ONNX through [`fastembed`](https://github.com/qdrant/fastembed). The model
+is downloaded on first use and cached locally — no GPU, no daemon, no cloud
+calls. Install with `pip install grafyx-mcp[embeddings]`.
 
-- **M1 Relevance ranker** -- 33-feature MLP scores each search result against the query.
-- **M3 Source token filter** -- suppresses noise tokens (imports, strings, magic methods) from full-text search.
-- **M4 Symbol importance** -- weights symbols by caller count, exports, and structural signals.
-- **M5 Bi-encoder** -- semantic embedding model (BPE tokenizer, FeedForward encoder) for natural-language code search.
-- **Gibberish detector** -- character-bigram MLP that blocks nonsense queries before they hit the index.
+Switch encoders via the `GRAFYX_ENCODER` env var:
 
-All weights ship inside the wheel (~11 MB total). Inference is pure numpy, no PyTorch at runtime.
+- `jina-v2` (default) — Apache-2.0, fastembed-native, ~150 MB.
+- `coderankembed` — MIT, 137M, CoIR nDCG@10 = 60.1, downloaded from a
+  custom HF repo. Becomes the default once the head-to-head benchmark in
+  [`docs/benchmarks/0.2.0/`](docs/benchmarks/0.2.0/) confirms it beats
+  jina-v2 by ≥3 nDCG@10 points.
+
+Supporting numpy-only MLPs (~5 MB total weights, bundled in the wheel):
+
+- **M1 Relevance ranker** — 33-feature MLP that re-ranks the encoder's top
+  candidates using structural signals (caller count, name overlap, exports).
+- **M3 Source token filter** — suppresses noise tokens (imports, strings,
+  magic methods) from full-text search.
+- **M4 Symbol importance** — weights symbols by caller count, exports, and
+  structural signals.
+- **Gibberish detector** — character-bigram MLP that blocks nonsense queries
+  before they hit the index.
+
+Reproducible benchmarks against FastAPI, Django, and Home Assistant ship in
+[`benchmarks/`](benchmarks/) (`python -m scripts.run_all`).
 
 ---
 

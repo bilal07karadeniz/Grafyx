@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0a1] - 2026-04-30
+
+### Added
+
+- Encoder registry in `grafyx/search/_embeddings.py`. Switch via the
+  `GRAFYX_ENCODER` env var. Choices: `jina-v2` (default, Apache-2.0,
+  fastembed-native) and `coderankembed` (MIT, 137M, registered via
+  `fastembed.add_custom_model` from a custom HF repo).
+- `find_related_code` response now includes `model` and `latency_ms`
+  metadata, plus a `degraded` flag and `action_hint` when the encoder is
+  unavailable (missing fastembed, build pending, or download failed).
+- `CodeSearcher.wait_for_index_ready(timeout)` blocks until the embedding
+  index has finished building, used by the benchmark harness.
+- Reproducible benchmark harness under `benchmarks/`. Single command:
+  `python -m scripts.run_all`. Pinned at FastAPI @ 4f64b8f6, Django @
+  02a7d43d, Home Assistant @ 3ed0d8a1. Eval pairs extracted per repo
+  from public-function docstrings.
+- New optional install extra `bench` for benchmark dependencies.
+
+### Changed
+
+- `find_related_code` semantic retrieval now goes through the
+  fastembed-backed `EmbeddingSearcher` exclusively. The M5 Mamba
+  bi-encoder hookup has been removed from the search path.
+- `EmbeddingSearcher.__init__` consumes the registry (`model_id` arg)
+  instead of a hard-coded `model_name`. Caches per-encoder so switching
+  does not invalidate the other's vectors.
+- `embeddings` extra now pins `fastembed>=0.7.0,<0.10.0` to protect
+  against breaking changes in `fastembed.add_custom_model`.
+
+### Deprecated
+
+- The M5 module (`grafyx/search/_code_encoder.py`) and its weight files
+  are no longer called from the search path. Their physical removal
+  waits on the head-to-head benchmark publishing the encoder winner in
+  `docs/benchmarks/0.2.0/`.
+
 ## [0.1.1] - 2026-04-29
 
 ### Added
@@ -30,5 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Object literal method detection in TypeScript / JavaScript.
 - Init.py re-export resolution in the import index.
 
+[0.2.0a1]: https://github.com/bilal07karadeniz/Grafyx/releases/tag/v0.2.0a1
 [0.1.1]: https://github.com/bilal07karadeniz/Grafyx/releases/tag/v0.1.1
 [0.1.0]: https://github.com/bilal07karadeniz/Grafyx/releases/tag/v0.1.0

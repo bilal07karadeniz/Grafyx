@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grafyx-mcp"
-version = "0.1.1"
+version = "0.2.0a1"
 description = "MCP server that gives AI coding assistants real-time codebase understanding via Graph-sitter"
 readme = "README.md"
 license = {text = "MIT"}
@@ -34,8 +34,12 @@ dev = [
     "pytest-asyncio>=0.23",
 ]
 embeddings = [
-    "fastembed>=0.7.0",
+    # Cap protects against breaking changes in fastembed.add_custom_model.
+    "fastembed>=0.7.0,<0.10.0",
     "numpy>=2.0.0",
+]
+bench = [
+    "pytest>=8.0",
 ]
 
 [project.scripts]

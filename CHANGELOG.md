@@ -45,12 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `embeddings` extra now pins `fastembed>=0.7.0,<0.10.0` to protect
   against breaking changes in `fastembed.add_custom_model`.
 
-### Deprecated
+### Removed
 
-- The M5 module (`grafyx/search/_code_encoder.py`) and its weight files
-  are no longer called from the search path. Their physical removal
-  waits on the head-to-head benchmark publishing the encoder winner in
-  `docs/benchmarks/0.2.0/`.
+- M5 from-scratch bi-encoder retired entirely. Deleted modules:
+  `grafyx/search/_code_encoder.py`, `grafyx/search/_tokenizer.py`,
+  `grafyx/search/_mamba.py`. Deleted weights:
+  `grafyx/search/model/code_encoder_weights.npz`,
+  `grafyx/search/model/bpe_merges.json`,
+  `grafyx/search/model/bpe_vocab.json`. Deleted training scripts:
+  `ml/train_m5.py`, `ml/train_m5m6_prototype.py`, `ml/evaluate_m5.py`,
+  `ml/pre_encode_m5.py`, `ml/generate_training_data_m5.py`. Deleted
+  tests: `tests/test_code_encoder.py`, `tests/test_tokenizer.py`,
+  `tests/test_mamba_inference.py`. Net wheel size reduction: ~5 MB.
 
 ## [0.1.1] - 2026-04-29
 

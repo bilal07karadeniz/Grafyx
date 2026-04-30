@@ -282,7 +282,7 @@ def parse_graded_response(text: str, sym: dict) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate M5 pairs via Claude Batch API")
+    parser = argparse.ArgumentParser(description="Generate query/symbol training pairs via Claude Batch API")
     parser.add_argument("--symbols", type=str, default=str(DEFAULT_SYMBOLS),
                         help="Path to all_symbols.json")
     parser.add_argument("--max-symbols", type=int, default=8000,

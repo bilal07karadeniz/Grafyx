@@ -1,10 +1,12 @@
-"""Head-to-head search benchmark: M5 baseline (and later: jina-v2, CodeRankEmbed).
+"""Head-to-head search benchmark across registered encoders.
 
 Measures nDCG@10 and MRR@10 per repo, per encoder, across the eval_data pairs.
 
 Usage:
-    python -m scripts.bench_search --encoder m5
-    python -m scripts.bench_search --encoder all
+    python -m scripts.bench_search --encoder jina-v2
+    python -m scripts.bench_search --encoder coderankembed
+    python -m scripts.bench_search --encoder tokens   # fastembed disabled
+    python -m scripts.bench_search --encoder all      # all registered encoders
 """
 from __future__ import annotations
 

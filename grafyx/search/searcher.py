@@ -363,9 +363,9 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     ))
 
         # --- Diversity merge ---
-        # Use a larger internal limit so augmentation engines (source, embeddings,
-        # M5) have headroom to contribute.  Final truncation to max_results
-        # happens at the end.
+        # Use a larger internal limit so augmentation engines (source tokens,
+        # embeddings) have headroom to contribute.  Final truncation to
+        # max_results happens at the end.
         internal_limit = max(max_results * 3, 30)
         merged = _merge_results(
             func_results, class_results, file_results,

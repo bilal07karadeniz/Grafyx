@@ -33,9 +33,6 @@ python ml/generate_claude_queries.py
 
 # 2. Train the M1-M4 feature MLPs
 python ml/retrain_all_real.py
-
-# 3. Train the M5 bi-encoder
-python ml/train_m5.py
 ```
 
 Training data files (multi-GB) are gitignored. See `ml/` for individual training scripts.

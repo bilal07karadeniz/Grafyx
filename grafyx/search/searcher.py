@@ -143,6 +143,17 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
         return []
 
     @property
+    def degraded(self) -> bool:
+        """True when the encoder is not available (offline, missing fastembed,
+        or build still pending). Callers can use this to surface a hint that
+        results came from token search alone.
+        """
+        return (
+            self._embedding_searcher is None
+            or not self._embedding_searcher._ready
+        )
+
+    @property
     def encoder_meta(self) -> dict:
         """Identify the active encoder for response metadata."""
         if self._embedding_searcher is None:

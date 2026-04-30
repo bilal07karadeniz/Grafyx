@@ -65,6 +65,13 @@ def find_related_code(description: str, max_results: int = 10) -> dict:
                 "Results may be approximate — consider refining your "
                 "query with specific function or class names."
             )
+
+        if getattr(_state._searcher, "degraded", False):
+            response["degraded"] = True
+            response["action_hint"] = (
+                "Semantic encoder unavailable — results from token search only. "
+                "Install fastembed via 'pip install grafyx-mcp[embeddings]' for higher quality."
+            )
         return truncate_response(response)
     except ToolError:
         raise

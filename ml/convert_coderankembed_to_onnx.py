@@ -25,6 +25,7 @@ OUT = Path(__file__).parent / "coderankembed_onnx_out"
 
 
 def main() -> None:
+    from huggingface_hub import snapshot_download
     from optimum.onnxruntime import (
         ORTModelForFeatureExtraction,
         ORTQuantizer,
@@ -35,11 +36,21 @@ def main() -> None:
     model_id = "nomic-ai/CodeRankEmbed"
     OUT.mkdir(parents=True, exist_ok=True)
 
+    # CodeRankEmbed ships custom modeling code whose state_dict loader has
+    # a bug in the HF-fallback branch: it defaults to safe_serialization=False
+    # and probes for pytorch_model.bin first, but the repo only ships
+    # model.safetensors. The local-file branch of the same loader handles
+    # safetensors correctly, so we snapshot-download the repo first and
+    # then point optimum at the local directory.
+    print(f"Snapshot-downloading {model_id}...")
+    local_model_path = snapshot_download(repo_id=model_id)
+    print(f"  -> {local_model_path}")
+
     print(f"Exporting {model_id} to ONNX...")
     model = ORTModelForFeatureExtraction.from_pretrained(
-        model_id, export=True, trust_remote_code=True
+        local_model_path, export=True, trust_remote_code=True
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True)
     model.save_pretrained(OUT)
     tokenizer.save_pretrained(OUT)
 

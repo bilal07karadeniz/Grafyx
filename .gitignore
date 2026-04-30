@@ -34,6 +34,7 @@ _write_test.py
 
 # IDE / editor
 .cursor/
+.claude/
 
 # ML training artifacts (never commit — multi-GB)
 ml/all_symbols.json

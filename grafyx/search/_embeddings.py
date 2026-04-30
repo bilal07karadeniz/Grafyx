@@ -73,12 +73,12 @@ ENCODER_REGISTRY = {
     },
     "coderankembed": {
         "id": "coderankembed",
-        "model_name": "bilal07karadeniz/grafyx-coderankembed-onnx",
+        "model_name": "Bilal7Dev/grafyx-coderankembed-onnx",
         "query_prefix": "Represent this query for searching relevant code: ",
         "needs_custom_registration": True,
         "dim": 768,
-        "hf_repo": "bilal07karadeniz/grafyx-coderankembed-onnx",
-        "model_file": "model.onnx",
+        "hf_repo": "Bilal7Dev/grafyx-coderankembed-onnx",
+        "model_file": "onnx/model.onnx",
     },
 }
 

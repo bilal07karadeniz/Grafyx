@@ -1,6 +1,6 @@
 """Upload the converted ONNX model to HuggingFace Hub.
 
-Target repo: bilal07karadeniz/grafyx-coderankembed-onnx (public, MIT).
+Target repo: Bilal7Dev/grafyx-coderankembed-onnx (public, MIT).
 
     pip install huggingface_hub
     huggingface-cli login    # one-time; paste a WRITE token from
@@ -16,20 +16,22 @@ from pathlib import Path
 
 from huggingface_hub import HfApi
 
-REPO_ID = "bilal07karadeniz/grafyx-coderankembed-onnx"
+REPO_ID = "Bilal7Dev/grafyx-coderankembed-onnx"
 OUT = Path(__file__).parent / "coderankembed_onnx_out"
 
 
 _README = """\
 # grafyx-coderankembed-onnx
 
-ONNX-int8 export of [`nomic-ai/CodeRankEmbed`](https://huggingface.co/nomic-ai/CodeRankEmbed)
+ONNX-int8 mirror of [`nomic-ai/CodeRankEmbed`](https://huggingface.co/nomic-ai/CodeRankEmbed)
 for use with [Grafyx](https://github.com/bilal07karadeniz/Grafyx) via
 [fastembed](https://github.com/qdrant/fastembed).
 
 - **Base model:** nomic-ai/CodeRankEmbed (137M params)
+- **Original ONNX-int8 conversion:** [`mrsladoje/CodeRankEmbed-onnx-int8`](https://huggingface.co/mrsladoje/CodeRankEmbed-onnx-int8)
+  — re-hosted here to give Grafyx a stable, version-pinned artifact.
 - **License:** MIT (inherits the base model's license)
-- **Format:** ONNX, dynamic int8 quantized (AVX-512-VNNI)
+- **Format:** ONNX, dynamic int8 quantized
 - **Pooling:** CLS
 - **Normalization:** L2 (cosine-ready)
 - **Embedding dim:** 768

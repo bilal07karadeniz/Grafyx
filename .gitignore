@@ -56,3 +56,6 @@ grafyx_start.sh
 benchmarks/repos/
 benchmarks/eval_data/
 benchmarks/results/
+
+# One-shot ONNX conversion output (large, uploaded to HF, not committed)
+ml/coderankembed_onnx_out/

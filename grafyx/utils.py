@@ -133,18 +133,37 @@ def truncate_response(data: Any, max_chars: int = 50_000) -> Any:
     return data
 
 
+_TS_JS_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _is_typescript_path(path: str) -> bool:
+    """True if the path looks like a JS/TS source file."""
+    if not path:
+        return False
+    return path.lower().endswith(_TS_JS_SUFFIXES)
+
+
 def format_function_signature(func: Any) -> str:
     """Format a graph-sitter Function object into a human-readable signature.
+
+    Emits Python ``def``/``async def`` syntax for ``.py``/``.pyi`` files and
+    TypeScript ``function``/``async function`` syntax for ``.ts``/``.tsx``/
+    ``.js``/``.jsx`` files. The language is inferred from the function's
+    ``filepath`` attribute.
 
     Args:
         func: A graph-sitter Function object.
 
     Returns:
-        String like 'async def func_name(param1: type1, param2: type2) -> ReturnType'
+        String like 'async def func_name(param1: type1) -> ReturnType' for
+        Python, or 'async function funcName(param1: type1): ReturnType' for
+        TypeScript/JavaScript.
     """
     try:
-        prefix = "async def" if safe_get_attr(func, "is_async", False) else "def"
         name = safe_get_attr(func, "name", "unknown")
+        is_async = safe_get_attr(func, "is_async", False)
+        filepath = safe_str(safe_get_attr(func, "filepath", ""))
+        is_ts = _is_typescript_path(filepath)
 
         # Build parameter string
         params = safe_get_attr(func, "parameters", [])
@@ -162,10 +181,15 @@ def format_function_signature(func: Any) -> str:
                 param_parts.append(part)
 
         param_str = ", ".join(param_parts)
-
         return_type = safe_get_attr(func, "return_type", None)
-        ret_str = f" -> {return_type}" if return_type else ""
 
+        if is_ts:
+            prefix = "async function" if is_async else "function"
+            ret_str = f": {return_type}" if return_type else ""
+            return f"{prefix} {name}({param_str}){ret_str}"
+
+        prefix = "async def" if is_async else "def"
+        ret_str = f" -> {return_type}" if return_type else ""
         return f"{prefix} {name}({param_str}){ret_str}"
     except Exception:
         return f"def {safe_get_attr(func, 'name', 'unknown')}(...)"

@@ -126,7 +126,10 @@ Grafyx's `find_related_code` uses a pretrained code embedding model (default:
 `jinaai/jina-embeddings-v2-base-code`, Apache-2.0, 161M params) running on CPU
 via ONNX through [`fastembed`](https://github.com/qdrant/fastembed). The model
 is downloaded on first use and cached locally — no GPU, no daemon, no cloud
-calls. Install with `pip install grafyx-mcp[embeddings]`.
+calls.
+
+Since 0.2.1, `fastembed` is a hard dependency, so the default install
+already includes the encoder — no extra needed.
 
 **Benchmark (0.2.0, 278 docstring→function queries across FastAPI + Django):**
 

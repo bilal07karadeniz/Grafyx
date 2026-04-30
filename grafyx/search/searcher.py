@@ -155,18 +155,34 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
 
     @property
     def encoder_meta(self) -> dict:
-        """Identify the active encoder for response metadata."""
+        """Identify the encoder *actually* used to score this response.
+
+        Returns ``{"model": "tokens", ...}`` when the embedding searcher is
+        absent or its index is not ready — i.e. when ``degraded`` is True.
+        Reporting the configured encoder id in that state is misleading
+        because the response was scored without it.
+        """
         if self._embedding_searcher is None:
-            return {"model": "none", "version": ""}
+            return {"model": "tokens", "version": "", "configured": "none"}
+
         cfg = getattr(self._embedding_searcher, "_cfg", None)
-        if not cfg:
+        configured_id = (
+            cfg["id"] if cfg
+            else getattr(self._embedding_searcher, "_model_name", "unknown")
+        )
+        configured_version = cfg.get("model_name", "") if cfg else ""
+
+        if not self._embedding_searcher._ready:
             return {
-                "model": getattr(self._embedding_searcher, "_model_name", "unknown"),
+                "model": "tokens",
                 "version": "",
+                "configured": configured_id,
             }
+
         return {
-            "model": cfg["id"],
-            "version": cfg.get("model_name", ""),
+            "model": configured_id,
+            "version": configured_version,
+            "configured": configured_id,
         }
 
     def wait_for_index_ready(self, timeout: float = 600.0) -> bool:

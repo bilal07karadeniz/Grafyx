@@ -418,12 +418,22 @@ class IndexBuilderMixin:
         # or "word: ClassName)". The ClassName must start with uppercase (convention
         # for class names in both Python and TS/JS).
         typed_re = re.compile(r'\b(\w+)\s*:\s*([A-Z]\w*)(?:\s*=|\s*[,\)])')
-        # Regex: local instantiation -- matches indented "var = ClassName(" lines.
-        # Requires leading whitespace to avoid matching module-level assignments
-        # (those are handled by _build_class_instances instead).
-        assign_re = re.compile(r'^[ \t]+(\w+)\s*=\s*([A-Z]\w*)\s*\(', re.MULTILINE)
-        # Regex: factory call -- matches indented "var = func_name(" for factory functions
-        factory_re = re.compile(r'^[ \t]+(\w+)\s*=\s*(\w+)\s*\(', re.MULTILINE)
+        # Regex: local instantiation -- matches indented "var = ClassName(" lines,
+        # optionally preceded by `await`. Requires leading whitespace to avoid
+        # matching module-level assignments (those are handled by
+        # ``_build_class_instances`` instead).
+        assign_re = re.compile(
+            r'^[ \t]+(\w+)\s*=\s*(?:await\s+)?([A-Z]\w*)\s*\(',
+            re.MULTILINE,
+        )
+        # Regex: factory call -- matches indented "var = func_name(" for factory
+        # functions. Also matches the async form ``var = await func_name(``,
+        # which is essential for projects that wrap factories as coroutines
+        # (e.g. ``coord = await get_coordinator()``).
+        factory_re = re.compile(
+            r'^[ \t]+(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(',
+            re.MULTILINE,
+        )
         # Regex: method call -- matches "var.method(" to find calls on typed locals
         method_call_re = re.compile(r'\b(\w+)\.(\w+)\s*\(')
         skip_vars = {"self", "cls"}

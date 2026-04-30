@@ -42,7 +42,9 @@ def get_project_skeleton(max_depth: int = 3, detail: str = "summary", include_hi
 
         # Collect every file the graph knows about.  Each entry is a dict
         # with keys like "path", "function_count", "class_count".
-        all_files = graph.get_all_files()
+        # Use a high cap so directory_stats stays consistent with
+        # get_module_context on large projects (default cap is 500).
+        all_files = graph.get_all_files(max_results=10000)
         file_paths = [f.get("path", "") for f in all_files if f.get("path")]
 
         # build_directory_tree() produces a nested dict like:
@@ -91,6 +93,44 @@ def get_project_skeleton(max_depth: int = 3, detail: str = "summary", include_hi
             sorted(dir_stats.items(), key=lambda x: x[1]["files"], reverse=True)
         )
 
+        # Build 2-level subdir stats for large top-level dirs so hints can
+        # drill deeper than "explore backend/" (which the agent already
+        # knows). A dir with >100 files is "big" enough to deserve a zoom.
+        BIG_DIR_THRESHOLD = 100
+        big_dirs = {
+            d for d, s in sorted_dir_stats.items()
+            if s.get("files", 0) > BIG_DIR_THRESHOLD
+        }
+        subdir_stats: dict[str, dict[str, dict[str, int]]] = {}
+        if big_dirs:
+            for f in all_files:
+                fpath = f.get("path", "").replace("\\", "/")
+                if not fpath:
+                    continue
+                rel = fpath
+                for root in roots:
+                    if fpath.startswith(root):
+                        rel = fpath[len(root):]
+                        break
+                parts = rel.split("/")
+                if len(parts) < 3:
+                    continue
+                top, sub = parts[0], parts[1]
+                if top not in big_dirs:
+                    continue
+                bucket = subdir_stats.setdefault(top, {})
+                entry = bucket.setdefault(
+                    sub, {"files": 0, "functions": 0, "classes": 0}
+                )
+                entry["files"] += 1
+                entry["functions"] += f.get("function_count", 0)
+                entry["classes"] += f.get("class_count", 0)
+            # Sort each subdir block by file count desc.
+            subdir_stats = {
+                top: dict(sorted(subs.items(), key=lambda x: x[1]["files"], reverse=True))
+                for top, subs in subdir_stats.items()
+            }
+
         result = {
             "project_path": graph.original_path,
             "languages": stats.get("languages", []),
@@ -99,16 +139,18 @@ def get_project_skeleton(max_depth: int = 3, detail: str = "summary", include_hi
             "total_classes": stats.get("total_classes", 0),
             "by_language": stats.get("by_language", {}),
             "directory_stats": sorted_dir_stats,
+            "subdir_stats": subdir_stats,
             "file_tree": tree,
         }
-        # Apply detail-level filtering
+        # Compute hints from the unfiltered response so they work even at
+        # detail="signatures", where directory_stats is stripped.
+        hints = compute_hints(graph, "skeleton", result) if include_hints else []
+
+        # Apply detail-level filtering after hints are computed.
         result = filter_by_detail(result, detail, "skeleton")
 
-        # Compute navigation hints (suggest most interesting modules)
-        if include_hints:
-            hints = compute_hints(graph, "skeleton", result)
-            if hints:
-                result["suggested_next"] = hints
+        if hints:
+            result["suggested_next"] = hints
 
         # truncate_response() caps the JSON size to avoid exceeding the
         # MCP client's context window.

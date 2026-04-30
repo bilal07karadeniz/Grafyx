@@ -68,10 +68,22 @@ def find_related_code(description: str, max_results: int = 10) -> dict:
 
         if getattr(_state._searcher, "degraded", False):
             response["degraded"] = True
-            response["action_hint"] = (
-                "Semantic encoder unavailable — results from token search only. "
-                "Install fastembed via 'pip install grafyx-mcp[embeddings]' for higher quality."
-            )
+            # Distinguish "encoder still warming up" from "encoder permanently
+            # missing" so the agent knows whether to retry or to act.
+            embed = getattr(_state._searcher, "_embedding_searcher", None)
+            if embed is None:
+                response["degraded_reason"] = "fastembed_missing"
+                response["action_hint"] = (
+                    "Semantic encoder package is not installed. Reinstall "
+                    "with `pip install --upgrade grafyx-mcp` (0.2.1+ "
+                    "bundles fastembed as a hard dependency)."
+                )
+            else:
+                response["degraded_reason"] = "index_warming_up"
+                response["action_hint"] = (
+                    "Embedding index is still being built in the background. "
+                    "Retry the same query in 30-60 seconds for full-quality results."
+                )
         return truncate_response(response)
     except ToolError:
         raise

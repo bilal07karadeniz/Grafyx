@@ -162,6 +162,57 @@ class TestDIPatternDetection:
         handler_entries = [c for c in callers if c["name"] == "handler"]
         assert len(handler_entries) == 1
 
+    def test_async_factory_pattern_resolves_method_calls(self):
+        """`coord = await get_coordinator()` should link `coord.method()` to the class."""
+        graph = self._make_graph()
+
+        # Factory function returns WorkerCoordinator
+        factory = MagicMock()
+        factory.name = "get_coordinator"
+        factory.filepath = "/project/factories.py"
+        factory.function_calls = []
+        factory.return_type = "WorkerCoordinator"
+        factory.source = "async def get_coordinator() -> WorkerCoordinator:\n    return _instance"
+
+        # Caller awaits the factory then calls a method on the result
+        caller = MagicMock()
+        caller.name = "send_transcript"
+        caller.filepath = "/project/api/voice/helpers.py"
+        caller.function_calls = []
+        caller.return_type = ""
+        caller.source = (
+            "async def send_transcript(text):\n"
+            "    coord = await get_coordinator()\n"
+            "    await coord.broadcast_transcript(text)\n"
+        )
+
+        # The class with the method
+        cls = MagicMock()
+        cls.name = "WorkerCoordinator"
+        cls.filepath = "/project/voice/coordinator.py"
+        broadcast_method = MagicMock()
+        broadcast_method.name = "broadcast_transcript"
+        broadcast_method.filepath = "/project/voice/coordinator.py"
+        broadcast_method.function_calls = []
+        broadcast_method.source = "async def broadcast_transcript(self, text): pass"
+        cls.methods = [broadcast_method]
+
+        py_codebase = MagicMock()
+        py_codebase.functions = [factory, caller]
+        py_codebase.classes = [cls]
+
+        graph._codebases = {"python": py_codebase}
+        graph._class_method_names = {"WorkerCoordinator": {"broadcast_transcript"}}
+        graph._caller_index = {}
+
+        graph._augment_index_with_local_var_types()
+
+        callers = graph._caller_index.get("broadcast_transcript", [])
+        caller_names = [c["name"] for c in callers]
+        assert "send_transcript" in caller_names, (
+            f"async-factory-resolved caller missing; got {caller_names}"
+        )
+
     def test_method_di_includes_class(self):
         """DI refs from class methods should include the class name."""
         graph = self._make_graph()

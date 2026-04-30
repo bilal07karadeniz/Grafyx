@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-30
+
+### Changed
+
+- **`fastembed` is now a hard dependency.** The 0.2.0 install advertised
+  the semantic encoder as the headline feature but shipped it behind the
+  `[embeddings]` extra, so most installs ran in degraded token-only mode
+  without realizing it. Reinstall with `pip install --upgrade grafyx-mcp`
+  to get the encoder out of the box. The `[embeddings]` extra is kept as
+  a no-op alias for backwards compatibility.
+- `find_related_code` now reports `"model": "tokens"` (not the configured
+  encoder id) when the response was actually scored without the encoder,
+  and surfaces a new `degraded_reason` field that distinguishes
+  `fastembed_missing` (action: reinstall) from `index_warming_up`
+  (action: retry in 30-60 s).
+
+### Fixed
+
+- `get_project_skeleton.directory_stats` undercounted on projects with
+  more than 500 files because the underlying `get_all_files()` was
+  invoked with the default cap. The skeleton now uses a 10K cap, matching
+  `get_module_context`. Reported in the v0.2.0 audit (file count for
+  `frontend/` showed 123, but `get_module_context("frontend/src/components")`
+  showed 194 just for that subtree).
+- TypeScript and JavaScript function signatures are now formatted with
+  TS/JS syntax (`function name(arg: T): R` /
+  `async function name(arg: T): R`) instead of being incorrectly rendered
+  as Python `def name(arg: T) -> R`. Detected from the file extension
+  (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`).
+- Async factory pattern (`coord = await get_coordinator()`) is now
+  resolved by `_augment_index_with_local_var_types`. Previously the
+  factory regex required a synchronous call site, so callers of methods
+  reached through an awaited factory (e.g. `coord.broadcast_transcript()`)
+  were missed entirely. This was the largest single accuracy gap on
+  factory-heavy codebases.
+- `get_project_skeleton` hints now drill into the largest non-test
+  subdirectory of any top-level dir with >100 files, e.g. suggesting
+  `get_module_context("backend/app")` instead of the redundant
+  `get_module_context("backend")`. Hints are also computed before
+  detail-level filtering, so they survive at `detail="signatures"`.
+
 ## [0.2.0] - 2026-04-30
 
 ### Added

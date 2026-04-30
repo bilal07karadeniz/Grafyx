@@ -213,10 +213,16 @@ def _hints_for_skeleton(data: dict) -> list[dict]:
     """After viewing the project skeleton, suggest the most interesting modules.
 
     Ranking: by total symbols (functions + classes), excluding test dirs.
+    For "big" top-level dirs (those with subdir_stats data), drill one
+    level deeper so hints point at e.g. ``backend/app`` rather than
+    plain ``backend`` -- a zoom an LLM can act on instead of re-running
+    the same query.
     """
     dir_stats = data.get("directory_stats", {})
     if not dir_stats:
         return []
+
+    subdir_stats = data.get("subdir_stats", {}) or {}
 
     scored = []
     for dir_name, stats in dir_stats.items():
@@ -231,13 +237,27 @@ def _hints_for_skeleton(data: dict) -> list[dict]:
     scored.sort(reverse=True)
     hints = []
     for score, dir_name, stats in scored[:MAX_HINTS]:
+        # When we know the top-level dir is large, point at its biggest
+        # non-test subdirectory so the agent gets a meaningfully smaller
+        # zoom on the next call.
+        target_path = dir_name
+        target_stats = stats
+        subs = subdir_stats.get(dir_name)
+        if subs:
+            for sub_name, sub_stats in subs.items():
+                if sub_name.lower() in _DEPRIORITIZED_DIRS or sub_name.startswith("."):
+                    continue
+                if sub_stats.get("files", 0) >= 5:
+                    target_path = f"{dir_name}/{sub_name}"
+                    target_stats = sub_stats
+                    break
         hints.append({
             "tool": "get_module_context",
-            "args": {"module_path": dir_name},
+            "args": {"module_path": target_path},
             "reason": (
-                f"{stats.get('files', 0)} files, "
-                f"{stats.get('functions', 0)} functions, "
-                f"{stats.get('classes', 0)} classes"
+                f"{target_stats.get('files', 0)} files, "
+                f"{target_stats.get('functions', 0)} functions, "
+                f"{target_stats.get('classes', 0)} classes"
             ),
         })
     return hints

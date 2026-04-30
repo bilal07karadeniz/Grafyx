@@ -46,7 +46,7 @@ _SIGNATURES_STRIP: dict[str, set[str]] = {
         "dependencies", "source",
     },
     "skeleton": {
-        "directory_stats", "by_language",
+        "directory_stats", "by_language", "subdir_stats",
     },
     "module": {
         "internal_imports",

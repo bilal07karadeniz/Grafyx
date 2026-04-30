@@ -31,11 +31,32 @@ jobs:
         with:
           skip-existing: true
 
+      - name: Extract CHANGELOG section for this tag
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          # Trim leading/trailing blank lines
+          sed -i -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}' release_notes.md
+          echo "Extracted release notes:"
+          cat release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "No CHANGELOG section found for $VERSION; falling back to auto-generated notes."
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fallback=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: ${{ steps.changelog.outputs.fallback == 'false' && 'release_notes.md' || '' }}
+          generate_release_notes: ${{ steps.changelog.outputs.fallback == 'true' }}
           files: dist/*
           fail_on_unmatched_files: true

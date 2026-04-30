@@ -41,6 +41,7 @@ Cache invalidation:
 """
 
 import logging
+import os
 
 from grafyx.graph import CodebaseGraph
 from grafyx.search._tokens import _tokenize_source
@@ -55,6 +56,94 @@ try:
     _HAS_EMBEDDINGS = True
 except ImportError:
     _HAS_EMBEDDINGS = False
+
+
+# --- Encoder registry ---
+# Each entry maps a Grafyx-internal id to (a) the model name fastembed
+# expects, (b) the query prefix the model was trained with (empty for
+# jina-v2), and (c) optional custom-model registration metadata for
+# fastembed.
+ENCODER_REGISTRY = {
+    "jina-v2": {
+        "id": "jina-v2",
+        "model_name": "jinaai/jina-embeddings-v2-base-code",
+        "query_prefix": "",
+        "needs_custom_registration": False,
+        "dim": 768,
+    },
+    "coderankembed": {
+        "id": "coderankembed",
+        "model_name": "bilal07karadeniz/grafyx-coderankembed-onnx",
+        "query_prefix": "Represent this query for searching relevant code: ",
+        "needs_custom_registration": True,
+        "dim": 768,
+        "hf_repo": "bilal07karadeniz/grafyx-coderankembed-onnx",
+        "model_file": "model.onnx",
+    },
+}
+
+# jina-v2 is shippable today (Apache-2.0, fastembed-native). CodeRankEmbed
+# becomes the default once the head-to-head benchmark in docs/benchmarks/0.2.0/
+# confirms it beats jina-v2 by >=3 nDCG@10 points.
+DEFAULT_ENCODER = "jina-v2"
+
+
+def resolve_model_config(env_var: str = "GRAFYX_ENCODER") -> dict:
+    """Look up the encoder config from the GRAFYX_ENCODER env var (or default).
+
+    Returns a fresh dict copy so callers can mutate without affecting the
+    registry.
+    """
+    chosen = os.environ.get(env_var, DEFAULT_ENCODER).strip().lower()
+    if chosen not in ENCODER_REGISTRY:
+        raise ValueError(
+            f"Unknown encoder {chosen!r}. "
+            f"Expected one of: {sorted(ENCODER_REGISTRY)}"
+        )
+    return dict(ENCODER_REGISTRY[chosen])
+
+
+_CUSTOM_REGISTERED: set[str] = set()
+
+
+def _register_custom_model_once(cfg: dict) -> None:
+    """Register a custom fastembed model if not already registered.
+
+    fastembed's add_custom_model is per-process global state; calling it
+    twice raises. We guard with a module-level set.
+    """
+    if not cfg.get("needs_custom_registration"):
+        return
+    if cfg["model_name"] in _CUSTOM_REGISTERED:
+        return
+    if not _HAS_EMBEDDINGS:
+        return
+    try:
+        from fastembed import TextEmbedding  # type: ignore[import-untyped]
+        from fastembed.common.model_description import (  # type: ignore[import-untyped]
+            ModelSource,
+            PoolingType,
+        )
+    except ImportError:
+        # Older/different fastembed builds expose model_description elsewhere.
+        # Fall through silently — search() will surface a clear failure when
+        # the model is actually requested.
+        logger.debug("fastembed model_description API not found; skipping custom registration")
+        return
+
+    try:
+        TextEmbedding.add_custom_model(
+            model=cfg["model_name"],
+            pooling=PoolingType.CLS,
+            normalization=True,
+            sources=ModelSource(hf=cfg["hf_repo"]),
+            dim=cfg["dim"],
+            model_file=cfg["model_file"],
+        )
+    except Exception as exc:  # fastembed raises if already registered or API mismatch
+        logger.debug("fastembed.add_custom_model failed: %s", exc)
+        return
+    _CUSTOM_REGISTERED.add(cfg["model_name"])
 
 
 class EmbeddingSearcher:
@@ -86,15 +175,23 @@ class EmbeddingSearcher:
         self,
         graph: CodebaseGraph,
         cache_dir: str = "~/.grafyx/embeddings",
-        model_name: str = "BAAI/bge-small-en-v1.5",
+        model_id: str | None = None,
     ):
-        import hashlib
-        import os
         from pathlib import Path
 
         self._graph = graph
-        self._model_name = model_name
-        self._cache_dir = Path(os.path.expanduser(cache_dir))
+        # Pull config from the registry (env-var-driven by default).
+        self._cfg = (
+            resolve_model_config()
+            if model_id is None
+            else dict(ENCODER_REGISTRY[model_id])
+        )
+        _register_custom_model_once(self._cfg)
+        self._model_name = self._cfg["model_name"]
+        self._query_prefix = self._cfg["query_prefix"]
+        # Cache per-encoder so switching encoders doesn't blow away the
+        # other's cached vectors.
+        self._cache_dir = Path(os.path.expanduser(cache_dir)) / self._cfg["id"]
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Function-level embedding state ---
@@ -415,11 +512,13 @@ class EmbeddingSearcher:
 
         try:
             model = TextEmbedding(self._model_name)
-            q_vectors = list(model.embed([query]))
+            full_query = (self._query_prefix or "") + query
+            q_vectors = list(model.embed([full_query]))
             q_vec = np.array(q_vectors[0], dtype=np.float32)
 
             # Cosine similarity via dot product (embeddings are pre-normalized
-            # by fastembed's BAAI/bge-small-en-v1.5 model)
+            # by the encoder model -- jina-v2 and CodeRankEmbed both emit
+            # unit-norm vectors).
             similarities = self._embeddings @ q_vec
             top_indices = np.argsort(similarities)[-top_k:][::-1]
 
@@ -470,7 +569,8 @@ class EmbeddingSearcher:
 
         try:
             model = TextEmbedding(self._model_name)
-            q_vectors = list(model.embed([query]))
+            full_query = (self._query_prefix or "") + query
+            q_vectors = list(model.embed([full_query]))
             q_vec = np.array(q_vectors[0], dtype=np.float32)
 
             similarities = self._file_embeddings @ q_vec

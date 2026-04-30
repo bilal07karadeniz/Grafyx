@@ -50,9 +50,15 @@ def _run_grafyx_encoder(repo_path: Path, queries: list[dict], encoder: str) -> l
     from grafyx.search.searcher import CodeSearcher
 
     graph = CodebaseGraph(str(repo_path), languages=["python"])
+    init_stats = graph.initialize()
+    print(f"    graph: {init_stats.get('total_functions', 0)} fns, "
+          f"{init_stats.get('total_classes', 0)} cls, "
+          f"{init_stats.get('duration_seconds', 0):.1f}s")
     searcher = CodeSearcher(graph)
     # Block on encoder build — for benchmarking we want a warm index.
-    searcher.wait_for_index_ready(timeout=600)
+    # Bumped to 1800 s so large repos (Home Assistant ~13k Python files)
+    # don't return uninitialized embeddings.
+    searcher.wait_for_index_ready(timeout=1800)
 
     rows: list[dict] = []
     for q in queries:
@@ -71,14 +77,15 @@ def _run_grafyx_encoder(repo_path: Path, queries: list[dict], encoder: str) -> l
     return rows
 
 
-def run(encoders: list[str]) -> dict:
+def run(encoders: list[str], repos: list[str] | None = None) -> dict:
     pins = json.loads((ROOT / "pinned_commits.json").read_text())
+    selected = [r for r in pins if (repos is None or r in repos)]
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = RESULTS_DIR / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summary: dict = {"run_id": run_id, "results": {}}
-    for repo_name in pins:
+    summary: dict = {"run_id": run_id, "encoders": encoders, "repos": selected, "results": {}}
+    for repo_name in selected:
         repo_path = REPOS_DIR / repo_name
         queries = load_eval_pairs(repo_name)
         if not queries:
@@ -109,6 +116,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--encoder", default="m5",
                         choices=["m5", "jina-v2", "coderankembed", "all"])
+    parser.add_argument("--repos", default=None,
+                        help="Comma-separated subset of pinned repos (default: all)")
     args = parser.parse_args()
     encs = ["m5", "jina-v2", "coderankembed"] if args.encoder == "all" else [args.encoder]
-    run(encs)
+    repos = [r.strip() for r in args.repos.split(",")] if args.repos else None
+    run(encs, repos=repos)

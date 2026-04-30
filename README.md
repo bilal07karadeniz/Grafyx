@@ -128,13 +128,22 @@ via ONNX through [`fastembed`](https://github.com/qdrant/fastembed). The model
 is downloaded on first use and cached locally — no GPU, no daemon, no cloud
 calls. Install with `pip install grafyx-mcp[embeddings]`.
 
+**Benchmark (0.2.0a1, 278 docstring→function queries across FastAPI + Django):**
+
+| Encoder | nDCG@10 | MRR@10 | p50 latency |
+|---|---:|---:|---:|
+| jina-v2 (default) | **0.787** | **0.741** | ~1.5 s |
+| coderankembed | 0.663 | 0.623 | ~1.3 s |
+
+Full breakdown + per-query JSONL: [`docs/benchmarks/0.2.0/`](docs/benchmarks/0.2.0/).
+
 Switch encoders via the `GRAFYX_ENCODER` env var:
 
-- `jina-v2` (default) — Apache-2.0, fastembed-native, ~150 MB.
-- `coderankembed` — MIT, 137M, CoIR nDCG@10 = 60.1, downloaded from a
-  custom HF repo. Becomes the default once the head-to-head benchmark in
-  [`docs/benchmarks/0.2.0/`](docs/benchmarks/0.2.0/) confirms it beats
-  jina-v2 by ≥3 nDCG@10 points.
+- `jina-v2` (default) — Apache-2.0, fastembed-native, ~150 MB. Wins on
+  accuracy; recommended unless you have a specific reason to switch.
+- `coderankembed` — MIT, 137M, ONNX-int8, ~140 MB. Lower latency but
+  ~12 nDCG@10 points behind jina-v2 in our eval. Hosted at
+  [`Bilal7Dev/grafyx-coderankembed-onnx`](https://huggingface.co/Bilal7Dev/grafyx-coderankembed-onnx).
 
 Supporting numpy-only MLPs (~5 MB total weights, bundled in the wheel):
 

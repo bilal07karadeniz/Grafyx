@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GRAFYX_ENCODER` env var. Choices: `jina-v2` (default, Apache-2.0,
   fastembed-native) and `coderankembed` (MIT, 137M, registered via
   `fastembed.add_custom_model` from a custom HF repo).
+- Published head-to-head encoder benchmark in
+  [`docs/benchmarks/0.2.0/`](docs/benchmarks/0.2.0/) — 278 queries
+  across FastAPI + Django. jina-v2 wins by 12.4 nDCG@10 points
+  (0.787 vs 0.663 average); decision rationale, raw JSON, and per-query
+  JSONL all committed.
+- Hosted ONNX-int8 mirror of CodeRankEmbed at
+  [`Bilal7Dev/grafyx-coderankembed-onnx`](https://huggingface.co/Bilal7Dev/grafyx-coderankembed-onnx)
+  so users opting in via `GRAFYX_ENCODER=coderankembed` get a
+  version-pinned artifact (re-host of `mrsladoje/CodeRankEmbed-onnx-int8`,
+  attribution in the model card).
 - `find_related_code` response now includes `model` and `latency_ms`
   metadata, plus a `degraded` flag and `action_hint` when the encoder is
   unavailable (missing fastembed, build pending, or download failed).

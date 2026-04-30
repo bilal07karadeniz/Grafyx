@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "grafyx_version": "0.2.0a1",
+  "run_date_utc": "2026-04-30",
+  "scope": "phase-0-1-alpha",
+  "scope_note": "FastAPI + Django head-to-head. Home Assistant deferred for the 0.2.0 GA benchmark.",
+  "eval_methodology": {
+    "source": "per-repo public function docstrings (first sentence -> query, function name -> expected_symbol)",
+    "filter": "5-25 word docstrings, public functions only, test/ directories excluded",
+    "metric_primary": "nDCG@10",
+    "metric_secondary": ["MRR@10", "latency_p50_ms"]
+  },
+  "repos": {
+    "fastapi": {
+      "url": "https://github.com/tiangolo/fastapi.git",
+      "commit": "4f64b8f65191b497255004e896a2bbfd7cfd1886",
+      "n_queries": 78
+    },
+    "django": {
+      "url": "https://github.com/django/django.git",
+      "commit": "02a7d43d02e2acc9325a5a27eb01ffe7dbba5c7f",
+      "n_queries": 200
+    }
+  },
+  "results": {
+    "fastapi": {
+      "jina-v2": {
+        "ndcg10_mean": 0.7703782977833853,
+        "mrr10_mean": 0.7055555555555556,
+        "latency_p50_ms": 1058.4883929999976,
+        "n": 78
+      },
+      "coderankembed": {
+        "ndcg10_mean": 0.7210183579449339,
+        "mrr10_mean": 0.6720085470085471,
+        "latency_p50_ms": 885.4385175000061,
+        "n": 78
+      }
+    },
+    "django": {
+      "jina-v2": {
+        "ndcg10_mean": 0.8033327389965621,
+        "mrr10_mean": 0.7755833333333333,
+        "latency_p50_ms": 1864.8268289999805,
+        "n": 200
+      },
+      "coderankembed": {
+        "ndcg10_mean": 0.6045207305904319,
+        "mrr10_mean": 0.5730833333333333,
+        "latency_p50_ms": 1663.6374140000498,
+        "n": 200
+      }
+    }
+  },
+  "averages_across_repos": {
+    "jina-v2": {
+      "ndcg10_mean": 0.7868555183899737,
+      "mrr10_mean": 0.7405694444444445
+    },
+    "coderankembed": {
+      "ndcg10_mean": 0.6627695442676829,
+      "mrr10_mean": 0.6225459401709402
+    }
+  },
+  "selection_rule": "ship coderankembed as default if ndcg10 > jina-v2 by >= 0.03 absolute. otherwise ship jina-v2.",
+  "decision": "jina-v2",
+  "decision_rationale": "jina-v2 leads by 12.4 nDCG@10 points on average (0.787 vs 0.663). Gap is 19.9 nDCG points on Django. CodeRankEmbed is ~16% faster but materially less accurate. CodeRankEmbed remains available via GRAFYX_ENCODER=coderankembed for users who want lower latency over precision."
+}

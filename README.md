@@ -128,7 +128,7 @@ via ONNX through [`fastembed`](https://github.com/qdrant/fastembed). The model
 is downloaded on first use and cached locally — no GPU, no daemon, no cloud
 calls. Install with `pip install grafyx-mcp[embeddings]`.
 
-**Benchmark (0.2.0a1, 278 docstring→function queries across FastAPI + Django):**
+**Benchmark (0.2.0, 278 docstring→function queries across FastAPI + Django):**
 
 | Encoder | nDCG@10 | MRR@10 | p50 latency |
 |---|---:|---:|---:|

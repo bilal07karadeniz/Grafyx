@@ -1,7 +1,7 @@
 # Grafyx 0.2 Benchmark — Encoder Head-to-Head
 
 **Date:** 2026-04-30
-**Grafyx version:** 0.2.0a1
+**Grafyx version:** 0.2.0
 **Scope:** FastAPI + Django (Home Assistant deferred for 0.2.0 GA)
 **Eval set:** Per-repo public-function docstrings (first sentence → query, function name → expected). 78 queries on FastAPI, 200 on Django, 278 total.
 **Metrics:** nDCG@10 (primary), MRR@10, p50 latency.
@@ -39,7 +39,7 @@
 
 ## Decision
 
-**`jina-v2` is the default encoder for v0.2.0a1.**
+**`jina-v2` is the default encoder for v0.2.0.**
 
 Per the locked selection rule (CodeRankEmbed must lead jina-v2 by ≥0.03 absolute nDCG@10 to ship as default), the picture is unambiguous:
 
@@ -60,7 +60,7 @@ The model is hosted at [`Bilal7Dev/grafyx-coderankembed-onnx`](https://huggingfa
 ## Reproduce
 
 ```bash
-git checkout v0.2.0a1
+git checkout v0.2.0
 pip install -e ".[embeddings,bench]"
 cd benchmarks
 python -m scripts.setup_repos                                 # one-time

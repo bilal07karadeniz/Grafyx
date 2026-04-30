@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grafyx-mcp"
-version = "0.2.0a1"
+version = "0.2.0"
 description = "MCP server that gives AI coding assistants real-time codebase understanding via Graph-sitter"
 readme = "README.md"
 license = {text = "MIT"}

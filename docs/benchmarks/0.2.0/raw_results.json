@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "grafyx_version": "0.2.0a1",
+  "grafyx_version": "0.2.0",
   "run_date_utc": "2026-04-30",
   "scope": "phase-0-1-alpha",
   "scope_note": "FastAPI + Django head-to-head. Home Assistant deferred for the 0.2.0 GA benchmark.",

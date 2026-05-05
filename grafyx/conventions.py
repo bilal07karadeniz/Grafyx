@@ -328,10 +328,34 @@ class ConventionDetector:
             if total == 0:
                 continue
 
-            # Return type annotations — use regex to ensure '->' follows
-            # the closing paren, not just appears anywhere in the signature
-            # (e.g. dict literals with '->' in default values)
-            with_return = [s for s in signatures if re.search(r'\)\s*->', s)]
+            # Return type annotations — language-specific syntax:
+            #   Python: ``def name(...) -> RetType:``
+            #   TS/JS:  ``function name(...): RetType``
+            # We use rfind on ")" to handle nested parens in parameter
+            # types (e.g. ``(cb: () => void)``) so the trailing ":" or
+            # "->" is detected on the OUTER closing paren only.
+            is_web = lang in ("typescript", "javascript")
+
+            def _has_return_annotation(sig: str) -> bool:
+                if not sig:
+                    return False
+                close = sig.rfind(")")
+                if close < 0:
+                    return False
+                rest = sig[close + 1:].lstrip()
+                if is_web:
+                    # `: RetType` (with non-empty type, not `=>` arrow body)
+                    if not rest.startswith(":"):
+                        return False
+                    after = rest[1:].lstrip()
+                    return bool(after) and not after.startswith("=")
+                # Python
+                if not rest.startswith("->"):
+                    return False
+                after = rest[2:].strip()
+                return bool(after)
+
+            with_return = [s for s in signatures if _has_return_annotation(s)]
             pct = len(with_return) / total
 
             if pct > 0.5:
@@ -342,7 +366,9 @@ class ConventionDetector:
                     examples=with_return[:3],
                 ))
             elif pct < 0.2:
-                without_return = [s for s in signatures if "->" not in s]
+                without_return = [
+                    s for s in signatures if not _has_return_annotation(s)
+                ]
                 conventions.append(Convention(
                     category="typing",
                     pattern=f"{lang_label}: Minimal type annotations ({int(pct * 100)}% of functions have return types)",

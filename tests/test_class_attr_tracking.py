@@ -153,3 +153,101 @@ class TestClassAttributeTypeTracking:
 
         callers = graph._caller_index.get("execute", [])
         assert len(callers) == 0, f"Expected no callers for untyped field, got: {callers}"
+
+    def test_async_factory_class_attr_resolves(self):
+        """self.coord = await get_coordinator() should resolve to
+        WorkerCoordinator when get_coordinator() is annotated as
+        returning WorkerCoordinator (audit Test 9 — v0.2.2 fix)."""
+        graph = self._make_graph()
+        graph._class_method_names["WorkerCoordinator"] = {"shutdown", "start"}
+
+        # Factory function with return-type annotation -> seeds
+        # _factory_return_types so Pass 3b can resolve it.
+        factory_fn = MagicMock()
+        factory_fn.name = "get_coordinator"
+        factory_fn.return_type = "WorkerCoordinator"
+
+        init_method = MagicMock()
+        init_method.name = "__init__"
+        init_method.filepath = "/project/service.py"
+        init_method.source = (
+            "async def __init__(self):\n"
+            "    self.coord = await get_coordinator()\n"
+        )
+
+        use_method = MagicMock()
+        use_method.name = "stop"
+        use_method.filepath = "/project/service.py"
+        use_method.source = (
+            "async def stop(self):\n"
+            "    await self.coord.shutdown()\n"
+        )
+        use_method.function_calls = []
+
+        cls = MagicMock()
+        cls.name = "WorkerService"
+        cls.filepath = "/project/service.py"
+        cls.methods = [init_method, use_method]
+        cls.source = "class WorkerService:\n    pass\n"
+
+        codebase = MagicMock()
+        codebase.functions = [factory_fn]
+        codebase.classes = [cls]
+        graph._codebases = {"python": codebase}
+        graph._class_method_names["WorkerService"] = {"__init__", "stop"}
+
+        graph._augment_index_with_class_attr_types = (
+            CodebaseGraph._augment_index_with_class_attr_types.__get__(graph)
+        )
+        graph._augment_index_with_class_attr_types()
+
+        callers = graph._caller_index.get("shutdown", [])
+        assert any(
+            c["name"] == "stop" and c.get("_trusted")
+            for c in callers
+        ), f"Expected stop() to be tracked as caller of WorkerCoordinator.shutdown via async factory, got: {callers}"
+
+    def test_class_body_typed_attribute_resolves(self):
+        """``coord: WorkerCoordinator = None`` declared at class
+        scope should seed field_types so self.coord.shutdown() resolves."""
+        graph = self._make_graph()
+        graph._class_method_names["WorkerCoordinator"] = {"shutdown"}
+
+        # Field declared at class body, no method assignment.
+        use_method = MagicMock()
+        use_method.name = "stop"
+        use_method.filepath = "/project/service.py"
+        use_method.source = (
+            "def stop(self):\n"
+            "    self.coord.shutdown()\n"
+        )
+        use_method.function_calls = []
+
+        cls = MagicMock()
+        cls.name = "Worker"
+        cls.filepath = "/project/service.py"
+        cls.methods = [use_method]
+        cls.source = (
+            "class Worker:\n"
+            "    coord: WorkerCoordinator = None\n"
+            "\n"
+            "    def stop(self):\n"
+            "        self.coord.shutdown()\n"
+        )
+
+        codebase = MagicMock()
+        codebase.functions = []
+        codebase.classes = [cls]
+        graph._codebases = {"python": codebase}
+        graph._class_method_names["Worker"] = {"stop"}
+
+        graph._augment_index_with_class_attr_types = (
+            CodebaseGraph._augment_index_with_class_attr_types.__get__(graph)
+        )
+        graph._augment_index_with_class_attr_types()
+
+        callers = graph._caller_index.get("shutdown", [])
+        assert any(
+            c["name"] == "stop" and c.get("_trusted")
+            for c in callers
+        ), f"Expected class-body-typed attr to resolve, got: {callers}"

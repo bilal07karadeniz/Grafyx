@@ -143,6 +143,59 @@ def _is_typescript_path(path: str) -> bool:
     return path.lower().endswith(_TS_JS_SUFFIXES)
 
 
+def _extract_ts_param_str(source: str) -> str | None:
+    """Extract the literal parameter list from a TS/JS function source.
+
+    Returns the content between the matching parens of the function
+    signature so destructured object params, default values, generics
+    and nested types render exactly as written. Returns None when the
+    paren structure can't be matched cleanly.
+
+    Why we need this: graph-sitter's ``parameters`` flattens
+    ``({ a, b }: Props)`` to two params both typed ``Props``, which
+    reconstructs back as ``(a: Props, b: Props)`` — misleading.
+    """
+    if not source:
+        return None
+    n = len(source)
+    angle_depth = 0
+    i = 0
+    # Skip until the first ( that's NOT inside a generic <...>.
+    while i < n and source[i] != "(":
+        c = source[i]
+        if c == "<":
+            angle_depth += 1
+        elif c == ">" and angle_depth > 0:
+            angle_depth -= 1
+        i += 1
+    if i >= n:
+        return None
+    # Walk to the matching close paren, tracking string literals,
+    # template literals, brace depth (for object types) and nested
+    # parens (for callback types).
+    j = i
+    depth = 0
+    in_str: str | None = None
+    while j < n:
+        c = source[j]
+        if in_str is not None:
+            if c == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in ('"', "'", "`"):
+            in_str = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return source[i + 1:j].strip()
+        j += 1
+    return None
+
+
 def format_function_signature(func: Any) -> str:
     """Format a graph-sitter Function object into a human-readable signature.
 
@@ -165,22 +218,34 @@ def format_function_signature(func: Any) -> str:
         filepath = safe_str(safe_get_attr(func, "filepath", ""))
         is_ts = _is_typescript_path(filepath)
 
-        # Build parameter string
-        params = safe_get_attr(func, "parameters", [])
-        param_parts = []
-        if params:
-            for p in params:
-                p_name = safe_get_attr(p, "name", "?")
-                p_type = safe_get_attr(p, "type", None)
-                p_default = safe_get_attr(p, "default", None)
-                part = p_name
-                if p_type:
-                    part += f": {p_type}"
-                if p_default is not None:
-                    part += f" = {p_default}"
-                param_parts.append(part)
+        # For TS/JS, prefer the literal param list extracted from source.
+        # graph-sitter flattens destructured object params (e.g.
+        # ``({ a, b }: Props)``) to multiple typed entries, which would
+        # reconstruct as ``(a: Props, b: Props)`` — misleading. The
+        # source-extracted form preserves destructuring, defaults, and
+        # complex types exactly as written.
+        param_str: str | None = None
+        if is_ts:
+            source = safe_str(safe_get_attr(func, "source", ""))
+            param_str = _extract_ts_param_str(source)
 
-        param_str = ", ".join(param_parts)
+        # Fallback: reconstruct from graph-sitter parameter list.
+        if param_str is None:
+            params = safe_get_attr(func, "parameters", [])
+            param_parts = []
+            if params:
+                for p in params:
+                    p_name = safe_get_attr(p, "name", "?")
+                    p_type = safe_get_attr(p, "type", None)
+                    p_default = safe_get_attr(p, "default", None)
+                    part = p_name
+                    if p_type:
+                        part += f": {p_type}"
+                    if p_default is not None:
+                        part += f" = {p_default}"
+                    param_parts.append(part)
+            param_str = ", ".join(param_parts)
+
         return_type = safe_get_attr(func, "return_type", None)
 
         if is_ts:

@@ -36,6 +36,8 @@ def get_module_context(
     module_path: str = "",
     detail: str = "summary",
     include_hints: bool = True,
+    offset: int = 0,
+    limit: int = 0,
 ) -> dict:
     """Get an overview of all symbols in a directory/package.
 
@@ -48,6 +50,12 @@ def get_module_context(
             "grafyx/graph"). Empty string means the whole project.
         detail: Level of detail: "signatures", "summary" (default), or "full".
         include_hints: If True, append navigation suggestions.
+        offset: Number of files to skip (for paginating large modules).
+        limit: Maximum number of files to return (0 = no limit, default).
+            Combine with offset to page through modules with hundreds
+            of files where the response would otherwise be truncated.
+            ``total_files`` in the response always reflects the full
+            count, regardless of pagination.
     """
     graph = _ensure_initialized()
     try:
@@ -144,9 +152,29 @@ def get_module_context(
                     entry["base_classes"] = cls_info["base_classes"]
                 file_symbols[rel]["classes"].append(entry)
 
-        # Build symbols list grouped by file
+        # Order all files first so totals reflect the full module,
+        # then slice the symbols list by offset/limit so callers can
+        # page through large modules (hundreds of files) without
+        # blowing past the response size limit.
+        sorted_paths = sorted(file_symbols.keys())
+        total_functions = sum(
+            len(file_symbols[p]["functions"]) for p in sorted_paths
+        )
+        total_classes = sum(
+            len(file_symbols[p]["classes"]) for p in sorted_paths
+        )
+
+        if offset < 0:
+            offset = 0
+        if limit and limit > 0:
+            paged_paths = sorted_paths[offset:offset + limit]
+        elif offset > 0:
+            paged_paths = sorted_paths[offset:]
+        else:
+            paged_paths = sorted_paths
+
         symbols = []
-        for file_path in sorted(file_symbols.keys()):
+        for file_path in paged_paths:
             data = file_symbols[file_path]
             filename = os.path.basename(file_path)
             symbols.append({
@@ -156,10 +184,13 @@ def get_module_context(
                 "classes": data["classes"],
             })
 
-        # Build internal import relationships within this module
+        # Build internal import relationships within this module.
+        # Only compute for files in the paged window so paginated
+        # responses don't carry import graphs for files the caller
+        # can't see anyway.
+        paged_set = set(paged_paths)
         internal_imports = []
-        for file_path in sorted(file_symbols.keys()):
-            # Try both original and mirror paths for import lookup
+        for file_path in paged_paths:
             abs_path = project_root + file_path
             forward = graph.get_forward_imports(abs_path)
             if not forward:
@@ -175,10 +206,6 @@ def get_module_context(
                     "imports": internal,
                 })
 
-        # Count totals
-        total_functions = sum(len(s["functions"]) for s in symbols)
-        total_classes = sum(len(s["classes"]) for s in symbols)
-
         result = {
             "module": module_filter or "(root)",
             "files": len(file_symbols),
@@ -187,6 +214,34 @@ def get_module_context(
             "symbols": symbols,
             "internal_imports": internal_imports,
         }
+        # Surface pagination state when it's actually paged so the
+        # caller knows there's more to fetch.
+        if offset > 0 or (limit and limit > 0 and len(file_symbols) > limit):
+            result["page"] = {
+                "offset": offset,
+                "limit": limit if limit > 0 else None,
+                "returned": len(paged_paths),
+                "total_files": len(file_symbols),
+                "has_more": (offset + len(paged_paths)) < len(file_symbols),
+            }
+        elif limit == 0 and len(file_symbols) > 80:
+            # Caller didn't paginate but the module is large enough
+            # that ``truncate_response`` will trim symbol entries.
+            # Surface a concrete next-call suggestion so the AI knows
+            # the tool can paginate instead of just being "too big".
+            example_module = module_filter or "."
+            result["pagination_hint"] = {
+                "reason": (
+                    f"Module has {len(file_symbols)} files; the default "
+                    f"response truncates large lists. Use offset/limit "
+                    f"to page through the full module."
+                ),
+                "suggested_call": (
+                    f"get_module_context(module_path={example_module!r}, "
+                    f"limit=50, offset=0)  # then increment offset by 50"
+                ),
+                "total_files": len(file_symbols),
+            }
 
         # Apply detail-level filtering
         result = filter_by_detail(result, detail, "module")

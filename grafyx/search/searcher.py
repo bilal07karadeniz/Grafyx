@@ -200,6 +200,8 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
         while _time.time() < deadline:
             if self._embedding_searcher._ready:
                 return True
+            if getattr(self._embedding_searcher, "_build_error", None):
+                return False  # Permanent failure; don't keep polling
             _time.sleep(0.5)
         return False
 
@@ -687,8 +689,15 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                         break
                 if not any_exact_name_hit:
                     source_idx = getattr(self, '_source_index', None) or {}
-                    any_source_hit = any(qt in source_idx for qt in query_tokens)
-                    if not any_source_hit:
+                    # When the ML model says gibberish, require >=2 distinct
+                    # query tokens to hit the source index before letting the
+                    # results through. A single coincidental match (e.g.,
+                    # "foobar" appearing in test fixtures) is too weak to
+                    # override the gibberish detection — that produced the
+                    # FastAPI v0.2.4 audit failure where "xyzzy foobar qlrmph"
+                    # returned high-confidence results from test_*_foobar.
+                    source_hits = sum(1 for qt in query_tokens if qt in source_idx)
+                    if source_hits < 2:
                         for r in results:
                             r["score"] = min(r["score"], 0.35)
                         best_score = results[0]["score"] if results else 0.0
@@ -935,6 +944,14 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
             if _path_norm in existing_files:
                 continue
             _path_parts = set(split_tokens(_path_norm))
+            # Split path tokens into directory-only vs filename so we
+            # can detect "weak" matches that come exclusively from
+            # directory names (e.g. query "login flow" matching the
+            # ``flows/`` directory in ``services/flows/activation.py``).
+            _filename = _path_norm.rsplit("/", 1)[-1]
+            _file_stem = _filename.rsplit(".", 1)[0] if "." in _filename else _filename
+            _filename_tokens = set(split_tokens(_file_stem))
+            _dir_only_tokens = _path_parts - _filename_tokens
             # Resolve file source tokens -- try full path, then descending suffixes.
             # The _file_source_tokens dict is keyed by path suffixes at multiple
             # depths (built in _ensure_source_index).
@@ -962,8 +979,23 @@ class CodeSearcher(ScoringMixin, SourceIndexMixin):
                     pass
             _hit_weight = sum(token_weights.get(qt, 1.0) for qt in query_tokens if qt in _combined)
             _coverage = _hit_weight / _total_q_weight
+            # Module-name collision guard: if every matching token only
+            # touches a directory name (not the filename, not source),
+            # the file is matching a generic container ("flows/",
+            # "services/", "models/") and not the query intent. Drop it.
+            _substantive = (_filename_tokens | _src_parts)
+            _substantive_hits = sum(
+                1 for qt in query_tokens if qt in _substantive
+            )
             if _distinct >= 2 and _coverage >= 0.30:
+                if _substantive_hits == 0:
+                    continue
                 _score = _coverage * 0.70
+                # Soft-penalize when only the directory carries the
+                # match weight (one substantive match isn't enough to
+                # outrank pure directory-noun coincidences).
+                if _substantive_hits < 2:
+                    _score *= 0.6
                 # Apply inline directory bonus (same logic as the existing bonus above)
                 _parent_dir = _path_norm.rsplit("/", 1)[0].rsplit("/", 1)[-1] if "/" in _path_norm else ""
                 _parent_toks = set(split_tokens(_parent_dir))

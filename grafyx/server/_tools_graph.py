@@ -17,6 +17,7 @@ would break if a symbol or module were changed.
 Registered on the shared ``mcp`` instance from ``_state.py``.
 """
 
+import re
 from typing import Any
 
 from fastmcp.exceptions import ToolError
@@ -30,6 +31,37 @@ from grafyx.utils import (
     safe_str,
     truncate_response,
 )
+
+
+def _classify_call_style(parent_source: str, called_name: str) -> str:
+    """Inspect the parent function source to classify how ``called_name``
+    is invoked.
+
+    Returns:
+        ``"dotted"``  — appears only as ``obj.<name>(`` (method/attribute call)
+        ``"bare"``    — appears only as ``<name>(`` (bare function call)
+        ``"mixed"``   — both forms occur in the source
+        ``"unknown"`` — neither pattern matched (no usable signal)
+
+    Used by ``_build_calls_tree`` to decide whether a multi-candidate
+    name resolution (e.g. ``refresh`` matching both an API route and a
+    method) should pick a method, a top-level function, or skip
+    expansion entirely.
+    """
+    if not parent_source or not called_name:
+        return "unknown"
+    escaped = re.escape(called_name)
+    # Bare: NOT preceded by dot or word char, then `name(`.
+    bare = re.search(rf"(?<![\w.]){escaped}\s*\(", parent_source) is not None
+    # Dotted: preceded by `.`, e.g. ``db.refresh(``.
+    dotted = re.search(rf"\.{escaped}\s*\(", parent_source) is not None
+    if dotted and not bare:
+        return "dotted"
+    if bare and not dotted:
+        return "bare"
+    if dotted and bare:
+        return "mixed"
+    return "unknown"
 
 
 def _suggest_alternatives(graph, query: str, max_suggestions: int = 5) -> list[str]:
@@ -113,6 +145,7 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
         # Check classes first (exact match, never ambiguous) so that
         # passing a class name like "CrawlCache" works directly instead
         # of falling into function disambiguation with its 20 methods.
+        sym_class_name: str | None = None
         class_result = graph.get_class(symbol_name)
         if class_result is not None and isinstance(class_result, (tuple, list)):
             if isinstance(class_result, list):
@@ -140,6 +173,21 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
                     ),
                     "matches": disambiguation,
                 })
+
+            # Preserve method-vs-function class info from the unambiguous
+            # function lookup so the caller-index source below can pass
+            # ``class_name=`` and avoid cross-class contamination. Only
+            # accept properly-shaped tuples — mocks and other shapes are
+            # treated as "no class info" and fall through.
+            try:
+                if isinstance(func_result, list) and func_result:
+                    item = func_result[0]
+                    if isinstance(item, tuple) and len(item) == 3:
+                        _, _, sym_class_name = item
+                elif isinstance(func_result, tuple) and len(func_result) == 3:
+                    _, _, sym_class_name = func_result
+            except (ValueError, TypeError):
+                sym_class_name = None
 
             symbol_result = graph.get_symbol(symbol_name)
             if symbol_result is None:
@@ -334,6 +382,23 @@ def get_dependency_graph(symbol_name: str, depth: int = 2) -> dict:
                         if c_file and c_file != symbol_file and c_file not in by_file:
                             by_file[c_file] = 1
 
+        # --- Source 4: caller index for functions/methods ---
+        # For function symbols, the import-name filter (Source 2) rejects
+        # files that import the *containing module* (e.g. ``auth_service``)
+        # rather than the function itself, and graph-sitter's ``.usages``
+        # often misses singleton-instance calls like
+        # ``auth_service.authenticate_user(...)``. The reverse caller
+        # index, however, captures these — so for non-class symbols we
+        # query it directly and merge the resulting files.
+        # ``class_name=sym_class_name`` is passed so a method symbol
+        # doesn't collect callers from other classes' same-named methods.
+        if kind == "function":
+            f_callers = graph.get_callers(symbol_name, class_name=sym_class_name)
+            for caller in f_callers:
+                c_file = graph.resolve_path(caller.get("file", ""))
+                if c_file and c_file != symbol_file and c_file not in by_file:
+                    by_file[c_file] = 1
+
         # --- Normalize and deduplicate paths ---
         # Different sources may produce the same file under different path
         # formats (absolute vs relative, mirror vs original).  resolve_path()
@@ -424,33 +489,83 @@ def get_call_graph(
             Each level represents one hop in the call chain.  Cycles are
             detected via the ``visited`` set.  The tree terminates when
             depth reaches 0 or a cycle is detected.
+
+            Method-call disambiguation: when ``obj.method()`` appears in
+            the parent function and ``method`` resolves to multiple
+            candidates (e.g. an API route and a class method with the
+            same name), we DO NOT blindly pick the first match.  Picking
+            the wrong one inserts an entire phantom call subtree.
+
+            Strategy:
+                - Detect call style from the parent function source.
+                - ``dotted`` -> prefer method candidates; if no method
+                  matches or multiple methods match, skip expansion.
+                - ``bare`` -> prefer top-level function candidates.
+                - ``mixed``/``unknown`` -> only expand when there's
+                  exactly one candidate.
+
+            Skipping expansion is the safe choice — the callee name
+            still appears in the tree, but no descendants are inserted.
             """
             name = safe_get_attr(fn, "name", "?")
             if current_depth <= 0 or name in visited:
                 return {}
             visited.add(name)
             tree = {}
+            parent_source = safe_str(safe_get_attr(fn, "source", ""))
             calls = safe_get_attr(fn, "function_calls", [])
             if calls:
                 for called in calls:
                     called_name = safe_get_attr(called, "name", "?")
-                    if called_name not in visited and called_name not in skip:
-                        # Resolve FunctionCall reference to actual Function
-                        # object for deeper expansion.  FunctionCall objects
-                        # (from .function_calls) don't have their own
-                        # .function_calls, so we look up the real Function
-                        # by name in the graph.
-                        resolved = called
-                        if current_depth > 1:
-                            result = graph.get_function(called_name)
-                            if result is not None:
-                                if isinstance(result, list):
-                                    resolved = result[0][1]
-                                else:
-                                    resolved = result[1]
-                        tree[called_name] = _build_calls_tree(
-                            resolved, current_depth - 1, visited
-                        )
+                    if called_name in visited or called_name in skip:
+                        continue
+                    if current_depth <= 1:
+                        # Leaf: record the name without expansion.
+                        tree[called_name] = {}
+                        continue
+
+                    # Resolve and disambiguate.
+                    result = graph.get_function(called_name)
+                    if result is None:
+                        # Likely an external function or builtin we
+                        # didn't filter — list it but don't recurse.
+                        tree[called_name] = {}
+                        continue
+                    candidates = result if isinstance(result, list) else [result]
+
+                    style = _classify_call_style(parent_source, called_name)
+                    method_cands = [c for c in candidates if c[2]]
+                    toplevel_cands = [c for c in candidates if not c[2]]
+
+                    chosen: tuple | None = None
+                    if style == "dotted":
+                        # Method/attribute call. Cross-class methods
+                        # with the same name (e.g. db.refresh vs the
+                        # /refresh route handler) must NOT collapse to
+                        # the route. If we can't pick exactly one
+                        # method candidate, skip expansion safely.
+                        if len(method_cands) == 1:
+                            chosen = method_cands[0]
+                        # else: ambiguous or external — leave as leaf.
+                    elif style == "bare":
+                        if len(toplevel_cands) == 1:
+                            chosen = toplevel_cands[0]
+                        elif len(toplevel_cands) == 0 and len(method_cands) == 1:
+                            # Source signal said bare but only methods
+                            # match — fall through cautiously.
+                            chosen = method_cands[0]
+                    else:
+                        # mixed / unknown — only expand if unambiguous.
+                        if len(candidates) == 1:
+                            chosen = candidates[0]
+
+                    if chosen is None:
+                        tree[called_name] = {}
+                        continue
+                    resolved = chosen[1]
+                    tree[called_name] = _build_calls_tree(
+                        resolved, current_depth - 1, visited,
+                    )
             return tree
 
         # ================================================================

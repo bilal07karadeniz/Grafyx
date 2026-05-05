@@ -200,6 +200,7 @@ class EmbeddingSearcher:
         self._ready = False       # True when function embeddings are usable
         self._building = False    # True during background build (prevents double-build)
         self._fingerprint = ""    # Cache key derived from function signatures
+        self._build_error: str | None = None  # Set when build() fails permanently
 
         # --- File-level embedding state ---
         self._file_embeddings = None  # numpy array (M, dim) or None
@@ -396,6 +397,7 @@ class EmbeddingSearcher:
 
         fp = self._compute_fingerprint()
         self._fingerprint = fp
+        logger.info("Grafyx embedding index: fingerprint %s (model=%s)", fp[:8], self._cfg["id"])
 
         # --- Try loading function-level embeddings from cache ---
         cache_file = self._cache_dir / f"{fp}_vectors.npy"
@@ -409,7 +411,7 @@ class EmbeddingSearcher:
                     self._metadata = json.load(f)
                 self._ready = True
                 func_loaded = True
-                logger.debug("Loaded function embeddings from cache (%d vectors)", len(self._metadata))
+                logger.info("Embedding index: loaded %d function vectors from cache", len(self._metadata))
             except Exception:
                 pass
 
@@ -425,41 +427,48 @@ class EmbeddingSearcher:
                     self._file_metadata = json.load(f)
                 self._file_ready = True
                 file_loaded = True
-                logger.debug("Loaded file embeddings from cache (%d vectors)", len(self._file_metadata))
+                logger.info("Embedding index: loaded %d file vectors from cache", len(self._file_metadata))
             except Exception:
                 pass
 
         if func_loaded and file_loaded:
+            logger.info("Embedding index: fully loaded from cache — ready")
             return
 
         # --- Build fresh embeddings for missing levels ---
         self._building = True
+        self._build_error = None
         try:
+            logger.info("Embedding index: loading model %r (first use may download ~150 MB)…", self._model_name)
             model = TextEmbedding(self._model_name)
+            logger.info("Embedding index: model loaded — building vectors")
 
             if not func_loaded:
                 docs = self._build_documents()
                 if docs:
+                    logger.info("Embedding index: embedding %d function documents…", len(docs))
                     vectors = list(model.embed(docs))
                     self._embeddings = np.array(vectors, dtype=np.float32)
                     np.save(str(cache_file), self._embeddings)
                     with open(str(meta_file), "w") as f:
                         json.dump(self._metadata, f)
                     self._ready = True
-                    logger.debug("Built function embeddings: %d vectors", len(docs))
+                    logger.info("Embedding index: %d function vectors built and cached", len(docs))
 
             if not file_loaded:
                 file_docs = self._build_file_documents()
                 if file_docs:
+                    logger.info("Embedding index: embedding %d file documents…", len(file_docs))
                     file_vectors = list(model.embed(file_docs))
                     self._file_embeddings = np.array(file_vectors, dtype=np.float32)
                     np.save(str(file_cache), self._file_embeddings)
                     with open(str(file_meta), "w") as f:
                         json.dump(self._file_metadata, f)
                     self._file_ready = True
-                    logger.debug("Built file embeddings: %d vectors", len(file_docs))
+                    logger.info("Embedding index: %d file vectors built and cached — ready", len(file_docs))
         except Exception as e:
-            logger.error("Embedding build failed: %s", e)
+            self._build_error = str(e)
+            logger.error("Embedding index build failed: %s", e)
         finally:
             self._building = False
 

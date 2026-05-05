@@ -16,6 +16,14 @@ build/
 .coverage
 htmlcov/
 
+# Audit reports — local working artifacts, regenerated each release
+audits/
+
+# Docs — internal notes, plans, and benchmark dumps. Already-tracked
+# files under docs/ stay tracked; this prevents new files from being
+# added to git.
+docs/
+
 # IDE
 .idea/
 .vscode/

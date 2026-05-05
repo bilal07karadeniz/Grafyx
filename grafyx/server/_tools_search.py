@@ -78,6 +78,14 @@ def find_related_code(description: str, max_results: int = 10) -> dict:
                     "with `pip install --upgrade grafyx-mcp` (0.2.1+ "
                     "bundles fastembed as a hard dependency)."
                 )
+            elif getattr(embed, "_build_error", None):
+                response["degraded_reason"] = "build_failed"
+                response["action_hint"] = (
+                    f"Embedding index build failed: {embed._build_error}. "
+                    "Check the server logs for details. Common causes: model "
+                    "download failure (network issue), disk space, or ONNX "
+                    "runtime incompatibility. Restart the server to retry."
+                )
             else:
                 response["degraded_reason"] = "index_warming_up"
                 response["action_hint"] = (

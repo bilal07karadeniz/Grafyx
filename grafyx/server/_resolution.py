@@ -46,7 +46,7 @@ _SIGNATURES_STRIP: dict[str, set[str]] = {
         "dependencies", "source",
     },
     "skeleton": {
-        "directory_stats", "by_language", "subdir_stats",
+        "directory_stats", "by_language", "subdir_stats", "file_tree",
     },
     "module": {
         "internal_imports",
@@ -124,6 +124,18 @@ def _strip_nested_details(data: dict, context_type: str) -> None:
                 func.pop("decorators", None)
             for cls in sym_group.get("classes", []):
                 cls.pop("docstring", None)
+
+    # Module signatures: aggressive compaction so hundreds of files
+    # can fit in one response. Drop method lists, base classes, and
+    # function signatures — keep just names. Callers with a specific
+    # class/function in mind can drill in via get_class/function_context.
+    if context_type == "module":
+        for sym_group in data.get("symbols", []):
+            for func in sym_group.get("functions", []):
+                func.pop("signature", None)
+            for cls in sym_group.get("classes", []):
+                cls.pop("methods", None)
+                cls.pop("base_classes", None)
 
     # Strip docstrings from methods listed in class context
     if context_type == "class":

@@ -34,7 +34,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from grafyx.utils import safe_get_attr
+from grafyx.utils import EXTENSION_TO_LANGUAGE, safe_get_attr
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,24 @@ class PathMixin:
                            Equals _original_path unless on a Windows mount.
         self._ignore_patterns: List of directory names to skip (node_modules, etc.).
     """
+
+    # --- File-extension language detection ---
+
+    @staticmethod
+    def _lang_from_path(path: str) -> str:
+        """Return the actual language for a file based on its extension.
+
+        Use this instead of the codebase parser key when reporting language
+        to users: graph-sitter parses .js with the TypeScript parser, so
+        keying on the codebase would mis-report .js files as 'typescript'.
+        """
+        if not path:
+            return ""
+        norm = path.replace("\\", "/")
+        if "." not in norm.rsplit("/", 1)[-1]:
+            return ""
+        ext = "." + norm.rsplit(".", 1)[-1].lower()
+        return EXTENSION_TO_LANGUAGE.get(ext, "")
 
     # --- Mirror Syncing (Windows/WSL Compatibility) ---
 

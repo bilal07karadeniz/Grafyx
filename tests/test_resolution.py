@@ -127,7 +127,13 @@ class TestFilterByDetail:
         assert "source" not in result
 
     def test_skeleton_signatures_strips_dir_stats(self):
-        """Skeleton at signatures level strips directory_stats."""
+        """Skeleton at signatures level strips heavy keys.
+
+        Strips directory_stats, by_language, subdir_stats, AND file_tree
+        (file_tree was added in v0.2.6 — it's the heaviest field and must
+        go away at signatures so the level is meaningfully smaller than
+        summary).
+        """
         data = {
             "project_path": "/app",
             "languages": ["python"],
@@ -141,7 +147,10 @@ class TestFilterByDetail:
         result = filter_by_detail(data, "signatures", "skeleton")
         assert "directory_stats" not in result
         assert "by_language" not in result
-        assert result["file_tree"] is not None
+        assert "file_tree" not in result
+        # Stat totals + project_path remain at signatures
+        assert result["total_files"] == 10
+        assert result["project_path"] == "/app"
 
     def test_missing_keys_handled_gracefully(self):
         """Should not crash if data doesn't have all expected keys."""

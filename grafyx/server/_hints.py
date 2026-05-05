@@ -359,7 +359,6 @@ def _hints_for_class(graph: Any, data: dict) -> list[dict]:
     Suggests: base class (if has one), most-called method, heaviest usage file.
     """
     hints = []
-    caller_index = getattr(graph, "_caller_index", {})
 
     # Suggest base class exploration
     base_classes = data.get("base_classes", [])
@@ -371,18 +370,26 @@ def _hints_for_class(graph: Any, data: dict) -> list[dict]:
                 "reason": "parent class",
             })
 
-    # Suggest most-called method
+    # Suggest most-called method.
+    # Use disambiguated `get_callers(name, class_name=cls_name)` so the
+    # count matches what `get_function_context` would return — the raw
+    # `_caller_index` lumps in callers of same-named methods from OTHER
+    # classes and reports a count that doesn't survive disambiguation.
+    cls_name = data.get("name", "")
     methods = data.get("methods", [])
     scored_methods = []
     for method in methods:
         name = method.get("name", "")
         if name.startswith("__"):
             continue
-        caller_count = len(caller_index.get(name, []))
+        try:
+            disambiguated = graph.get_callers(name, class_name=cls_name)
+            caller_count = len(disambiguated)
+        except Exception:
+            caller_count = 0
         scored_methods.append((caller_count, name))
     scored_methods.sort(reverse=True)
 
-    cls_name = data.get("name", "")
     for _score, method_name in scored_methods[:1]:
         qualified = f"{cls_name}.{method_name}" if cls_name else method_name
         reason = f"{_score} callers" if _score > 0 else "key method"

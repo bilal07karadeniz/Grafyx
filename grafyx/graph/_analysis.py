@@ -55,6 +55,34 @@ class AnalysisMixin:
         "Protocol", "ABC", "ABCMeta",
     })
 
+    # Base class names that are *not* indicators of framework dispatch. A class
+    # extending these is just a plain Python object — its methods can still be
+    # genuinely unused. Anything not in this set, when found as an external
+    # ancestor (no definition in the codebase), is treated as a framework
+    # base whose methods may be polymorphically dispatched.
+    _NON_DISPATCHING_BASES = frozenset({
+        "object", "type", "Exception", "BaseException",
+        "Warning", "DeprecationWarning", "UserWarning", "FutureWarning",
+        "RuntimeError", "ValueError", "TypeError", "KeyError", "AttributeError",
+        "ImportError", "OSError", "IOError", "NotImplementedError",
+        "Generic", "TypedDict", "NamedTuple",
+        "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+        "tuple", "list", "dict", "set", "frozenset", "str", "bytes", "int",
+        "float", "bool", "complex",
+    })
+
+    # Top-level functions in files matching these suffixes are likely plugin /
+    # extension hooks dispatched dynamically by an external framework
+    # (MkDocs, pytest, Sphinx, Discord cogs, etc.). Skip them in unused
+    # detection — false positives here would mislead a developer into deleting
+    # framework integration code.
+    _HOOK_FILE_SUFFIXES = (
+        "_hooks.py", "_hook.py",
+        "_plugin.py", "_plugins.py",
+        "_extension.py", "_extensions.py",
+        "conftest.py",
+    )
+
     # ===================================================================
     # Dead Code Detection: Unused Functions
     # ===================================================================
@@ -153,7 +181,7 @@ class AnalysisMixin:
         FRAMEWORK_DECORATORS = {
             # Python
             "property", "cached_property", "staticmethod", "classmethod",
-            "abstractmethod", "overload", "override",
+            "abstractmethod", "overload", "override", "deprecated",
             "route", "get", "post", "put", "delete", "patch",
             "api_view", "action", "websocket",
             "exception_handler", "middleware",
@@ -258,6 +286,14 @@ class AnalysisMixin:
                     continue
 
                 if name == "main" or file_path.replace("\\", "/").endswith("__main__.py"):
+                    continue
+
+                # Skip top-level functions in plugin/hook files — these are
+                # dispatched by external frameworks and look unused statically.
+                _norm_path = file_path.replace("\\", "/")
+                if not class_name and any(
+                    _norm_path.endswith(s) for s in self._HOOK_FILE_SUFFIXES
+                ):
                     continue
 
                 # Check if this function is explicitly imported by name elsewhere.
@@ -366,6 +402,19 @@ class AnalysisMixin:
                                         skip = True
                                         break
 
+                        # Body-deprecation check: if the function emits a
+                        # DeprecationWarning via warnings.warn(), it's
+                        # intentionally kept for backwards compatibility.
+                        # FastAPI's `generate_operation_id` uses this pattern
+                        # rather than the (Python 3.13+) @deprecated decorator.
+                        if not skip:
+                            _src = safe_str(safe_get_attr(func_obj, "source", ""))
+                            if "warnings.warn" in _src and (
+                                "DeprecationWarning" in _src
+                                or "PendingDeprecationWarning" in _src
+                            ):
+                                skip = True
+
                         # Skip methods that implement an abstract/protocol contract.
                         # We check two conditions (transitively through the full MRO):
                         # 1. Any ancestor is a Protocol/ABC -- all its concrete methods
@@ -378,8 +427,23 @@ class AnalysisMixin:
                             if all_ancs & self._ABSTRACT_BASE_NAMES:
                                 skip = True
                             elif all_ancs:
+                                _cdi = getattr(self, "_class_defined_in", {}) or {}
                                 for _anc in all_ancs:
                                     if name in self._class_method_names.get(_anc, set()):
+                                        skip = True
+                                        break
+                                    # External (non-codebase, non-builtin) base
+                                    # class — likely a framework type whose
+                                    # methods may be polymorphically dispatched
+                                    # (Starlette Route, Django Model, Pydantic
+                                    # BaseModel, etc.). Better to under-flag
+                                    # than to mislead someone into deleting an
+                                    # override that the framework calls.
+                                    if (
+                                        _cdi
+                                        and _anc not in _cdi
+                                        and _anc not in self._NON_DISPATCHING_BASES
+                                    ):
                                         skip = True
                                         break
 
@@ -565,42 +629,95 @@ class AnalysisMixin:
     # Subclass Tree Traversal
     # ===================================================================
 
-    def get_subclasses(self, class_name: str, depth: int = 3) -> dict | None:
+    def get_subclasses(
+        self,
+        class_name: str,
+        depth: int = 3,
+        file_path: str | None = None,
+    ) -> dict | None:
         """Find all classes that extend the given class, recursively.
 
         Builds a reverse inheritance map (base_name -> [child_class_dicts])
         and then does a BFS/DFS traversal up to the specified depth.
         Uses a ``visited`` set to handle diamond inheritance safely.
 
+        When the project has multiple classes with the same name (e.g.,
+        FastAPI's ``SecurityBase`` exists in both ``security/base.py`` and
+        ``openapi/models.py``), pass ``file_path`` to disambiguate. Without
+        it, the first match wins and the result includes a ``candidates``
+        list and an ``ambiguous`` flag listing all definitions found.
+
         Args:
             class_name: The base class to find subclasses of.
             depth: How many inheritance levels to traverse (1 = direct only).
+            file_path: When multiple classes share ``class_name``, narrows
+                the query to the definition in this file. Children are then
+                filtered to those whose own imports trace ``class_name`` back
+                to this same file (heuristic — children with no resolvable
+                import are conservatively included).
 
         Returns:
-            Dict with class info, direct/total counts, and a nested
-            ``subclasses`` tree. None if the class is not found.
+            Dict with class info, direct/total counts, a nested
+            ``subclasses`` tree, and (if ambiguous) ``candidates`` +
+            ``ambiguous: True``. None if the class is not found.
         """
         with self._lock:
             all_classes = self.get_all_classes(max_results=2000)
 
-            # Check that the target class exists
+            # Find ALL classes matching the name to detect ambiguity
+            candidates_list = [
+                c for c in all_classes if c.get("name") == class_name
+            ]
+            if not candidates_list:
+                return None
+
+            # Pick the target: file_path-disambiguated if provided, else first.
             target = None
-            for cls_dict in all_classes:
-                if cls_dict.get("name") == class_name:
-                    target = cls_dict
-                    break
-            if target is None:
+            if file_path:
+                _norm_fp = file_path.replace("\\", "/")
+                for c in candidates_list:
+                    if c.get("file", "").replace("\\", "/") == _norm_fp:
+                        target = c
+                        break
+                if target is None:
+                    # file_path provided but no match — fall back to first
+                    target = candidates_list[0]
+            else:
+                target = candidates_list[0]
+
+            target_file = target.get("file", "").replace("\\", "/")
+            ambiguous = len(candidates_list) > 1
+            disambiguate = ambiguous and file_path is not None
+
+            # Resolve which definition of `name` is in scope at child_file by
+            # consulting the symbol-import map. Returns the source file path
+            # that the child imports `name` from, or None if untracked.
+            sym_imports_idx = getattr(self, "_file_symbol_imports", {}) or {}
+
+            def _resolved_base_file(child_file: str, base_name: str) -> str | None:
+                cf = child_file.replace("\\", "/")
+                imports = sym_imports_idx.get(cf) or sym_imports_idx.get(child_file, {})
+                for source, names in imports.items():
+                    if base_name in names:
+                        return source.replace("\\", "/")
                 return None
 
             # Build reverse map: base_name -> [child_class_dicts]
+            # When disambiguating, only include children whose imports
+            # resolve `class_name` to target_file (or are untracked).
             children_of: dict[str, list[dict]] = {}
             for cls_dict in all_classes:
+                child_file = cls_dict.get("file", "")
                 for base in cls_dict.get("base_classes", []):
                     base_name = str(base).split(".")[-1].strip()
-                    if base_name:
-                        if base_name not in children_of:
-                            children_of[base_name] = []
-                        children_of[base_name].append(cls_dict)
+                    if not base_name:
+                        continue
+                    if disambiguate and base_name == class_name:
+                        # Skip children whose imports point to a DIFFERENT file
+                        rb = _resolved_base_file(child_file, base_name)
+                        if rb is not None and rb != target_file:
+                            continue
+                    children_of.setdefault(base_name, []).append(cls_dict)
 
             # Recursively build subclass tree
             def _build_tree(name: str, current_depth: int, visited: set) -> list[dict]:
@@ -633,7 +750,7 @@ class AnalysisMixin:
             direct_count = len(children_of.get(class_name, []))
             total_count = _count(tree)
 
-            return {
+            result = {
                 "class_name": class_name,
                 "file": target.get("file", ""),
                 "line": target.get("line"),
@@ -642,4 +759,18 @@ class AnalysisMixin:
                 "total_subclass_count": total_count,
                 "subclasses": tree,
             }
+            if ambiguous:
+                result["ambiguous"] = True
+                result["candidates"] = [
+                    {"file": c.get("file", ""), "line": c.get("line")}
+                    for c in candidates_list
+                ]
+                if not file_path:
+                    result["note"] = (
+                        f"Multiple classes named '{class_name}' exist "
+                        f"({len(candidates_list)} definitions). Pass "
+                        "file_path= to disambiguate; current result uses "
+                        f"the first match: {target_file}"
+                    )
+            return result
 

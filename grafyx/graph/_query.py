@@ -308,11 +308,12 @@ class SymbolQueryMixin:
                     for func in codebase.functions:
                         if len(results) >= max_results:
                             break
+                        _fp = self.translate_path(str(safe_get_attr(func, "filepath", "")))
                         results.append({
                             "name": safe_get_attr(func, "name", ""),
                             "signature": format_function_signature(func),
-                            "file": self.translate_path(str(safe_get_attr(func, "filepath", ""))),
-                            "language": lang,
+                            "file": _fp,
+                            "language": self._lang_from_path(_fp) or lang,
                             "line": self.get_line_number(func),
                             "docstring": safe_str(safe_get_attr(func, "docstring", "")),
                         })
@@ -327,11 +328,12 @@ class SymbolQueryMixin:
                                 for method in methods:
                                     if len(results) >= max_results:
                                         break
+                                    _mfp = self.translate_path(str(safe_get_attr(method, "filepath", "")))
                                     results.append({
                                         "name": safe_get_attr(method, "name", ""),
                                         "signature": format_function_signature(method),
-                                        "file": self.translate_path(str(safe_get_attr(method, "filepath", ""))),
-                                        "language": lang,
+                                        "file": _mfp,
+                                        "language": self._lang_from_path(_mfp) or lang,
                                         "line": self.get_line_number(method),
                                         "docstring": safe_str(safe_get_attr(method, "docstring", "")),
                                         "class_name": cls_name,
@@ -431,8 +433,9 @@ class SymbolQueryMixin:
                         if len(results) >= max_results:
                             break
                         summary = format_class_summary(cls)
-                        summary["file"] = self.translate_path(str(safe_get_attr(cls, "filepath", "")))
-                        summary["language"] = lang
+                        _cfp = self.translate_path(str(safe_get_attr(cls, "filepath", "")))
+                        summary["file"] = _cfp
+                        summary["language"] = self._lang_from_path(_cfp) or lang
                         summary["line"] = self.get_line_number(cls)
                         if include_method_names:
                             methods = safe_get_attr(cls, "methods", [])
@@ -483,7 +486,7 @@ class SymbolQueryMixin:
                             "function_count": len(list(functions)) if functions else 0,
                             "class_count": len(list(classes)) if classes else 0,
                             "import_count": len(list(imports)) if imports else 0,
-                            "language": lang,
+                            "language": self._lang_from_path(translated) or lang,
                             "docstring": safe_str(safe_get_attr(f, "docstring", "")),
                         })
                 except Exception as e:
@@ -548,50 +551,60 @@ class SymbolQueryMixin:
         ``get_project_skeleton`` tool.
         """
         with self._lock:
-            by_language = {}
+            # Aggregate by *file-extension* language, not codebase parser
+            # key: graph-sitter parses .js files with the TypeScript parser,
+            # so keying on the codebase would mis-report .js as 'typescript'.
+            by_language: dict[str, dict[str, int]] = {}
             total_files = 0
             total_functions = 0
             total_classes = 0
 
-            for lang, codebase in self._codebases.items():
+            def _bump(lang: str, key: str, n: int = 1) -> None:
+                if not lang:
+                    return
+                bucket = by_language.setdefault(
+                    lang, {"files": 0, "functions": 0, "classes": 0}
+                )
+                bucket[key] += n
+
+            for codebase_lang, codebase in self._codebases.items():
                 try:
-                    files = sum(
-                        1 for f in codebase.files
-                        if not self._is_ignored_file_path(
-                            self.translate_path(str(safe_get_attr(f, "path", safe_get_attr(f, "filepath", ""))))
+                    for f in codebase.files:
+                        fp = self.translate_path(
+                            str(safe_get_attr(f, "path", safe_get_attr(f, "filepath", "")))
                         )
-                    )
-                    functions = sum(
-                        1 for func in codebase.functions
-                        if not self._is_ignored_file_path(
-                            self.translate_path(str(safe_get_attr(func, "filepath", "")))
+                        if self._is_ignored_file_path(fp):
+                            continue
+                        ext_lang = self._lang_from_path(fp) or codebase_lang
+                        _bump(ext_lang, "files")
+                        total_files += 1
+                    for func in codebase.functions:
+                        fp = self.translate_path(
+                            str(safe_get_attr(func, "filepath", ""))
                         )
-                    )
-                    classes = sum(
-                        1 for cls in codebase.classes
-                        if not self._is_ignored_file_path(
-                            self.translate_path(str(safe_get_attr(cls, "filepath", "")))
+                        if self._is_ignored_file_path(fp):
+                            continue
+                        ext_lang = self._lang_from_path(fp) or codebase_lang
+                        _bump(ext_lang, "functions")
+                        total_functions += 1
+                    for cls in codebase.classes:
+                        fp = self.translate_path(
+                            str(safe_get_attr(cls, "filepath", ""))
                         )
-                    )
-                    by_language[lang] = {
-                        "files": files,
-                        "functions": functions,
-                        "classes": classes,
-                    }
-                    total_files += files
-                    total_functions += functions
-                    total_classes += classes
+                        if self._is_ignored_file_path(fp):
+                            continue
+                        ext_lang = self._lang_from_path(fp) or codebase_lang
+                        _bump(ext_lang, "classes")
+                        total_classes += 1
                 except Exception as e:
-                    logger.error(f"Error getting stats for {lang}: {e}")
-                    by_language[lang] = {
-                        "files": 0,
-                        "functions": 0,
-                        "classes": 0,
-                        "error": str(e),
-                    }
+                    logger.error(f"Error getting stats for {codebase_lang}: {e}")
+                    by_language.setdefault(
+                        codebase_lang,
+                        {"files": 0, "functions": 0, "classes": 0},
+                    )["error"] = str(e)
 
             result = {
-                "languages": list(self._codebases.keys()),
+                "languages": sorted(by_language.keys()),
                 "total_files": total_files,
                 "total_functions": total_functions,
                 "total_classes": total_classes,

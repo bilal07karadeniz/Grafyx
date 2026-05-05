@@ -28,6 +28,7 @@ from grafyx.server._hints import compute_hints
 from grafyx.server._resolution import filter_by_detail
 from grafyx.server._state import _ensure_initialized, _find_reference_lines, mcp
 from grafyx.utils import (
+    EXTENSION_TO_LANGUAGE,
     extract_base_classes,
     format_class_summary,
     format_file_summary,
@@ -38,16 +39,66 @@ from grafyx.utils import (
 )
 
 
+# Web-family languages share a parser and call into each other natively,
+# so a TS file calling a JS function (or vice versa) is NOT a cross-
+# language jump. Anything outside this set crossing into Python (or
+# vice versa) is treated as cross-language and filtered conservatively.
+_WEB_LANGS = frozenset({"typescript", "javascript"})
+
+
+def _filter_cross_language_callers(
+    callers: list[dict], target_lang: str,
+) -> list[dict]:
+    """Drop weak cross-language callers that are likely name-collision FPs.
+
+    A frontend file calling a same-named backend function only makes
+    sense via an HTTP/API client wrapper, which always shows up as a
+    method call (e.g. ``api.login(...)``) — never as a bare ``login()``
+    in another language. We keep cross-language callers ONLY when they
+    invoke through a receiver (``has_dot_syntax=True``), because a bare
+    ``login()`` in TypeScript is by definition calling the TypeScript
+    ``login`` symbol, not the Python one.
+    """
+    if not target_lang:
+        return callers
+    target_family = "web" if target_lang in _WEB_LANGS else target_lang
+    out: list[dict] = []
+    for c in callers:
+        cf = c.get("file", "")
+        if not cf or "." not in cf:
+            out.append(c)
+            continue
+        ext = "." + cf.rsplit(".", 1)[-1].lower()
+        cl = EXTENSION_TO_LANGUAGE.get(ext, "")
+        cf_family = "web" if cl in _WEB_LANGS else cl
+        if not cl or cf_family == target_family:
+            out.append(c)
+            continue
+        # Cross-language: require dot syntax (an actual method/property
+        # call on a receiver object). Bare same-name calls almost
+        # always resolve to a local function in the caller's language.
+        if c.get("has_dot_syntax", False):
+            out.append(c)
+    return out
+
+
 # --- Tool 2: get_function_context ---
 
 
 @mcp.tool
-def get_function_context(function_name: str, detail: str = "summary", include_hints: bool = True) -> dict:
+def get_function_context(
+    function_name: str,
+    detail: str = "summary",
+    include_hints: bool = True,
+    file_path: str = "",
+) -> dict:
     """Get comprehensive context for a function: signature, parameters,
     callers, callees, dependencies, and docstring.
 
     Supports 'ClassName.method_name' syntax (e.g., 'ToolExecutor.execute').
-    If multiple functions share the same name, returns a disambiguation list.
+    For two top-level functions sharing the same name in different
+    files (where ``ClassName.method`` doesn't apply), pass ``file_path``
+    to pick one. If multiple matches remain, returns a disambiguation list.
 
     Use this when you need to understand what a function does, who calls it,
     and what its blast radius is for modifications.
@@ -56,6 +107,10 @@ def get_function_context(function_name: str, detail: str = "summary", include_hi
         function_name: Name of the function to look up.
         detail: Level of detail: "signatures", "summary" (default), or "full".
         include_hints: If True, append navigation suggestions.
+        file_path: Optional path filter to disambiguate same-named
+            top-level functions in different files. Matched by
+            substring against each candidate's filepath, so a partial
+            path like ``"api/agents.py"`` is enough.
     """
     graph = _ensure_initialized()
     try:
@@ -69,7 +124,21 @@ def get_function_context(function_name: str, detail: str = "summary", include_hi
         # in both ToolExecutor and Database).  We present all matches so the
         # AI can re-call with "ClassName.method_name" to disambiguate.
         if isinstance(result, list):
-            if len(result) > 1:
+            # Apply file_path filter first when provided. This lets a
+            # caller select between two same-named top-level functions
+            # in different files — the ``ClassName.method`` form alone
+            # can't disambiguate those (both have cls_name=None).
+            if file_path and len(result) > 1:
+                file_path_norm = file_path.replace("\\", "/")
+                filtered = [
+                    item for item in result
+                    if file_path_norm in str(
+                        safe_get_attr(item[1], "filepath", "")
+                    ).replace("\\", "/")
+                ]
+                if len(filtered) >= 1:
+                    result = filtered
+            if isinstance(result, list) and len(result) > 1:
                 disambiguation = []
                 for lang, func, cls_name in result:
                     qualified = f"{cls_name}.{safe_get_attr(func, 'name', '?')}" if cls_name else safe_get_attr(func, "name", "?")
@@ -83,7 +152,8 @@ def get_function_context(function_name: str, detail: str = "summary", include_hi
                     "ambiguous": True,
                     "message": (
                         f"Multiple functions named '{function_name}' found. "
-                        f"Use 'ClassName.method_name' syntax to disambiguate."
+                        f"Use 'ClassName.method_name' syntax — or pass "
+                        f"``file_path=`` to pick by file — to disambiguate."
                     ),
                     "matches": disambiguation,
                 })
@@ -164,8 +234,12 @@ def get_function_context(function_name: str, detail: str = "summary", include_hi
         # class_name parameter filters out methods with the same name in
         # OTHER classes (e.g., Database.connect calling "execute" won't
         # appear in ToolExecutor.execute's callers).
+        # Cross-language callers (e.g. a TS file appearing as caller of
+        # a Python route) are filtered to require dot-syntax — a bare
+        # ``login()`` in TS calls the TS ``login``, not the Python one.
         func_name = safe_get_attr(func, "name", function_name)
         callers = graph.get_callers(func_name, class_name=cls_name)
+        callers = _filter_cross_language_callers(callers, lang)
         if callers:
             context["called_by"] = callers
 
@@ -585,6 +659,54 @@ def get_class_context(class_name: str, detail: str = "summary", include_hints: b
                     "file": uf,
                     "lines": lines[:5],
                 })
+
+        # --- Strategy 4: factory-pattern callers ---
+        # When a class is consumed via a factory (e.g. ``coord = await
+        # get_coordinator()`` rather than ``coord = WorkerCoordinator()``),
+        # the class name never appears at the call site. Strategies 1-3
+        # therefore miss every consumer. The caller-index augmentation
+        # built ``_factory_return_types`` (factory_fn_name -> class_name)
+        # in v0.2.2 to fix the *method-resolution* side; here we use the
+        # same mapping to surface the *files* that use the class.
+        factory_map = getattr(graph, "_factory_return_types", {})
+        if factory_map:
+            factory_names = [
+                fn for fn, ret_cls in factory_map.items()
+                if ret_cls == cls_name_str
+            ]
+            if factory_names:
+                already_listed: set[str] = {
+                    u["file"] for u in context["cross_file_usages"]
+                }
+                factory_files: set[str] = set()
+                for fn_name in factory_names:
+                    for caller in graph.get_callers(fn_name):
+                        c_file = graph.resolve_path(caller.get("file", ""))
+                        if c_file and c_file != cls_file and c_file not in already_listed:
+                            factory_files.add(c_file)
+                for ff in sorted(factory_files):
+                    # Light reference-line lookup for both the factory
+                    # function name and the class name itself.
+                    lines = _find_reference_lines(ff, cls_name_str)
+                    for fn_name in factory_names:
+                        more = _find_reference_lines(ff, fn_name)
+                        for ln in more:
+                            if ln not in lines:
+                                lines.append(ln)
+                    lines.sort()
+                    if lines:
+                        context["cross_file_usages"].append({
+                            "file": ff,
+                            "lines": lines[:5],
+                        })
+                    else:
+                        # Caller is real even when text search misses
+                        # (text search may miss class-name occurrences
+                        # in renamed imports). Record without lines.
+                        context["cross_file_usages"].append({
+                            "file": ff,
+                            "lines": [],
+                        })
 
         # --- Dependencies ---
         deps = safe_get_attr(cls, "dependencies", [])

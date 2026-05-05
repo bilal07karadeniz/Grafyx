@@ -68,7 +68,23 @@ logger = logging.getLogger(__name__)
 # Module-level compiled regexes for __init__.py re-export resolution.
 # Kept outside the class so MagicMock(spec=...) in tests doesn't shadow them.
 _RE_RELATIVE_IMPORT = re.compile(r"from\s+\.(\w[\w.]*)\s+import\s+(.+)")
+# Dict entry: ``"X": ".submodule"`` (with leading dot — explicit relative).
 _RE_LAZY_DICT_ENTRY = re.compile(r'["\'](\w+)["\']\s*:\s*["\']\.(\w[\w.]*)["\']')
+# Dict entry: ``"X": "submodule"`` (without leading dot, common alt form).
+_RE_LAZY_DICT_ENTRY_NODOT = re.compile(
+    r'["\'](\w+)["\']\s*:\s*["\'](\w[\w.]*)["\']'
+)
+# Inline ``from .submod import X`` inside a function body (e.g. inside
+# ``__getattr__`` if/elif branches).
+_RE_INLINE_RELATIVE_IMPORT = re.compile(
+    r"from\s+\.(\w[\w.]*)\s+import\s+(\w+(?:\s*,\s*\w+)*)"
+)
+# ``importlib.import_module(f".{name}", __package__)`` — wildcard form
+# meaning any imported attribute is forwarded to a same-named submodule.
+_RE_LAZY_WILDCARD = re.compile(
+    r"importlib\.import_module\s*\(\s*"
+    r"""(?:f["']\.\{[^}]+\}["']|["']\.["']\s*\+\s*\w+)"""
+)
 
 
 def _resolve_submodule_path(
@@ -413,6 +429,9 @@ class IndexBuilderMixin:
                             break
             except Exception:
                 continue
+        # Persist for Pass 3b (class-attr factory pattern) to reuse
+        # without rebuilding the same map.
+        self._factory_return_types = factory_returns
 
         # Regex: typed param/local -- matches "word: ClassName =" or "word: ClassName,"
         # or "word: ClassName)". The ClassName must start with uppercase (convention
@@ -548,11 +567,13 @@ class IndexBuilderMixin:
     def _augment_index_with_class_attr_types(self) -> None:
         """Resolve method calls through ``self.field`` class attribute types (Pass 3b).
 
-        Scans class methods for two patterns:
+        Scans class methods for three patterns:
 
         **Phase A** — Build ``field_types`` mapping per class:
-            - ``self.field = ClassName(...)``  (assignment in ``__init__`` or other method)
-            - ``self.field: ClassName = ...``  (typed assignment)
+            - ``self.field = ClassName(...)``        (direct instantiation)
+            - ``self.field: ClassName = ...``        (typed assignment)
+            - ``self.field = (await )?factory(...)`` (factory function with known return type)
+            - Class-body typed attribute: ``field: ClassName = ...``
 
         **Phase B** — Link ``self.field.method()`` calls to the target class:
             When ``field`` has a known type and ``method`` exists in that type's
@@ -561,11 +582,36 @@ class IndexBuilderMixin:
         This resolves false positives in dead code detection for methods called
         through class attributes, e.g.:
             - ``self.executor = ToolExecutor(config)`` in ``__init__``
+            - ``self.coord = await get_coordinator()`` (factory pattern)
+            - ``_coord: WorkerCoordinator = None`` at class scope
             - ``self.executor.execute(tools)`` in another method
         """
         all_class_names: set[str] = set(self._class_method_names.keys())
         if not all_class_names:
             return
+
+        # Reuse the factory_returns map computed in Pass 3 if it has
+        # been populated as an instance attribute; otherwise rebuild it
+        # locally so Pass 3b stays independent.
+        factory_returns: dict[str, str] = getattr(
+            self, "_factory_return_types", {},
+        ) or {}
+        if not factory_returns:
+            for _lang, codebase in self._codebases.items():
+                try:
+                    for func in codebase.functions:
+                        fn = safe_get_attr(func, "name", "")
+                        if not fn:
+                            continue
+                        ret = safe_str(safe_get_attr(func, "return_type", ""))
+                        if not ret:
+                            continue
+                        for candidate in re.findall(r'[A-Z]\w+', ret):
+                            if candidate in all_class_names:
+                                factory_returns[fn] = candidate
+                                break
+                except Exception:
+                    continue
 
         # Regex: self.field = ClassName( or self.field: ClassName = ...
         # Captures (field_name, ClassName) where ClassName starts with uppercase
@@ -574,6 +620,21 @@ class IndexBuilderMixin:
         )
         attr_typed_re = re.compile(
             r'self\.(\w+)\s*:\s*([A-Z]\w*)\s*='
+        )
+        # Regex: self.field = (await )?factory_func( — factory call form.
+        # Pairs with ``factory_returns`` to infer the field's class type
+        # (e.g. ``self.coord = await get_coordinator()`` ->
+        # ``WorkerCoordinator`` if get_coordinator's return type is known).
+        attr_factory_re = re.compile(
+            r'self\.(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\('
+        )
+        # Regex: class-body typed attribute -- ``field: ClassName = ...``
+        # or just ``field: ClassName`` (no assignment). These appear at
+        # class scope, NOT inside methods, so the caller must search the
+        # class source above any method bodies.
+        cls_typed_attr_re = re.compile(
+            r'^[ \t]+(\w+)\s*:\s*([A-Z]\w*)(?:\s*=|\s*$)',
+            re.MULTILINE,
         )
         # Regex: self.field.method(
         attr_call_re = re.compile(r'self\.(\w+)\.(\w+)\s*\(')
@@ -592,20 +653,47 @@ class IndexBuilderMixin:
                     if not methods:
                         continue
 
-                    # Phase A: scan ALL methods for self.field type assignments
+                    # Phase A: scan class source + all method bodies for
+                    # field type signals.
                     field_types: dict[str, str] = {}
+
+                    # A.0: class-body typed attributes
+                    # (``field: ClassName = ...`` outside any method).
+                    cls_source = safe_str(safe_get_attr(cls, "source", ""))
+                    if cls_source:
+                        for m in cls_typed_attr_re.finditer(cls_source):
+                            field_name, type_name = m.group(1), m.group(2)
+                            if (
+                                field_name not in ("self", "cls")
+                                and type_name in all_class_names
+                            ):
+                                field_types[field_name] = type_name
+
                     for method in methods:
                         source = safe_str(safe_get_attr(method, "source", ""))
                         if not source:
                             continue
+                        # A.1: ``self.field = ClassName(...)``
                         for m in attr_assign_re.finditer(source):
                             field_name, type_name = m.group(1), m.group(2)
                             if type_name in all_class_names:
                                 field_types[field_name] = type_name
+                        # A.2: ``self.field: ClassName = ...``
                         for m in attr_typed_re.finditer(source):
                             field_name, type_name = m.group(1), m.group(2)
                             if type_name in all_class_names:
                                 field_types[field_name] = type_name
+                        # A.3: ``self.field = (await )?factory(...)`` —
+                        # only fills slots not already set by A.1/A.2,
+                        # so direct instantiations win over factories.
+                        if factory_returns:
+                            for m in attr_factory_re.finditer(source):
+                                field_name, fn_name = m.group(1), m.group(2)
+                                if field_name in field_types:
+                                    continue
+                                ret_cls = factory_returns.get(fn_name)
+                                if ret_cls:
+                                    field_types[field_name] = ret_cls
 
                     if not field_types:
                         continue
@@ -1586,16 +1674,63 @@ class IndexBuilderMixin:
                                     "language": lang,
                                 })
 
+                            # Fast path: Python relative imports (from .module import X)
+                            # _extract_module_from_import skips these (returns ""),
+                            # so we resolve them directly using the importer's directory.
+                            if fpath.endswith(".py") and imp_source.startswith("from ."):
+                                target = self._resolve_python_relative_import(
+                                    imp_source, fpath, suffix_to_path
+                                )
+                                if target:
+                                    if target not in index:
+                                        index[target] = []
+                                    if fpath not in index[target]:
+                                        index[target].append(fpath)
+                                    if fpath not in forward:
+                                        forward[fpath] = []
+                                    if target not in forward[fpath]:
+                                        forward[fpath].append(target)
+                                    sym_names = self._extract_symbol_names_from_import(imp_source)
+                                    if sym_names:
+                                        if fpath not in symbol_imports:
+                                            symbol_imports[fpath] = {}
+                                        if target not in symbol_imports[fpath]:
+                                            symbol_imports[fpath][target] = set()
+                                        symbol_imports[fpath][target].update(sym_names)
+                                continue  # skip suffix-matching fallback for relative imports
+
                             module = self._extract_module_from_import(imp_source)
                             if not module:
                                 continue
 
-                            # Skip known external packages (pip + stdlib)
+                            module_as_path = module.replace(".", "/")
+
+                            # Skip known external packages (pip + stdlib),
+                            # UNLESS this is a `from <pkg> import <submod>`
+                            # where `<pkg>/<submod>.py` exists locally. That
+                            # signals the project's own package (its name in
+                            # pyproject.toml leaked into _external_packages),
+                            # not a same-name external dependency.
+                            #
+                            # We deliberately require BOTH the package match
+                            # AND a specific submodule file: a bare `import X`
+                            # (or `from X import Y` where Y is just a class
+                            # from external X) should still be skipped, even
+                            # if a local `X.py` happens to shadow the name.
                             top_level = module.split(".")[0].replace("-", "_").lower()
                             if top_level in self._external_packages:
-                                continue
-
-                            module_as_path = module.replace(".", "/")
+                                _is_intra_project = False
+                                if imp_source.startswith("from "):
+                                    _sym_names = self._extract_symbol_names_from_import(imp_source)
+                                    for _sym in _sym_names:
+                                        if (
+                                            suffix_to_path.get(f"{module_as_path}/{_sym}.py")
+                                            or suffix_to_path.get(f"{module_as_path}/{_sym}/__init__.py")
+                                        ):
+                                            _is_intra_project = True
+                                            break
+                                if not _is_intra_project:
+                                    continue
 
                             # Determine source file language from extension
                             src_ext = ""
@@ -1673,6 +1808,7 @@ class IndexBuilderMixin:
             self._file_symbol_imports = symbol_imports
             self._convention_import_sources = conv_imports
             self._resolve_init_reexports()
+            self._augment_with_submodule_imports(suffix_to_path)
         logger.debug("Import index built: %d reverse, %d forward, %d symbol-level entries",
                      len(self._import_index), len(self._forward_import_index),
                      len(self._file_symbol_imports))
@@ -1764,22 +1900,90 @@ class IndexBuilderMixin:
                         symbol_to_source[sym] = resolved
 
             # --- Pattern 2: __getattr__ lazy loading ---
+            # Three subpatterns recognised:
+            #   (a) dict-with-leading-dot: ``"X": ".impl"``
+            #   (b) dict-no-dot:           ``"X": "impl"``
+            #   (c) inline ``from .impl import X``
+            #   (d) wildcard ``importlib.import_module(f".{name}", ...)``
+            #       — any same-named submodule is treated as resolvable.
+            # In addition, a fallback heuristic registers same-named
+            # submodules whenever ``__getattr__`` is defined at all, so
+            # consumers of arbitrary lazy loaders still get resolved.
             functions = safe_get_attr(file_obj, "functions", [])
+            has_getattr = False
+            wildcard_lazy = False
             for func in functions:
                 func_name = safe_str(safe_get_attr(func, "name", ""))
                 if func_name != "__getattr__":
                     continue
+                has_getattr = True
                 func_source = safe_str(safe_get_attr(func, "source", ""))
                 if not func_source:
                     continue
+                # 2a: dict entries with leading dot (preferred form).
                 for match in _RE_LAZY_DICT_ENTRY.finditer(func_source):
                     sym_name = match.group(1)
-                    submod = match.group(2)  # e.g., "impl" or "sub.deep"
+                    submod = match.group(2)
                     resolved = _resolve_submodule_path(
                         pkg_dir, submod, all_known_files
                     )
                     if resolved:
                         symbol_to_source[sym_name] = resolved
+                # 2b: dict entries without leading dot.
+                # Only register if it actually resolves to a submodule
+                # of THIS package — guards against unrelated dicts.
+                for match in _RE_LAZY_DICT_ENTRY_NODOT.finditer(func_source):
+                    sym_name = match.group(1)
+                    submod = match.group(2)
+                    if sym_name in symbol_to_source:
+                        continue  # 2a already mapped it
+                    resolved = _resolve_submodule_path(
+                        pkg_dir, submod, all_known_files
+                    )
+                    if resolved:
+                        symbol_to_source[sym_name] = resolved
+                # 2c: inline ``from .submod import X`` inside __getattr__.
+                for match in _RE_INLINE_RELATIVE_IMPORT.finditer(func_source):
+                    submod = match.group(1)
+                    names_str = match.group(2)
+                    resolved = _resolve_submodule_path(
+                        pkg_dir, submod, all_known_files
+                    )
+                    if not resolved:
+                        continue
+                    for n in names_str.split(","):
+                        n = n.strip().split(" as ")[0].split()[0]
+                        if n.isidentifier() and n not in symbol_to_source:
+                            symbol_to_source[n] = resolved
+                # 2d: wildcard form — any same-named submodule resolves.
+                if _RE_LAZY_WILDCARD.search(func_source):
+                    wildcard_lazy = True
+
+            # Fallback: if __getattr__ is defined and we still have no
+            # explicit mapping for some attributes, register every
+            # same-named submodule of this package. This catches the
+            # majority of real lazy-loader patterns — including those
+            # that compose from a registry or read submodule names at
+            # runtime — at the price of accepting an extra implicit
+            # mapping per submodule. False positives are bounded: a
+            # symbol only resolves if a matching submodule actually
+            # exists on disk.
+            if has_getattr or wildcard_lazy:
+                pkg_dir_prefix = pkg_dir + "/"
+                for fpath in all_known_files:
+                    if not fpath.startswith(pkg_dir_prefix):
+                        continue
+                    rel = fpath[len(pkg_dir_prefix):]
+                    if rel == "__init__.py":
+                        continue
+                    # Direct sibling module: ``foo.py`` -> name ``foo``.
+                    if rel.endswith(".py") and "/" not in rel:
+                        base = rel[:-3]
+                        symbol_to_source.setdefault(base, fpath)
+                    # Direct sub-package: ``foo/__init__.py`` -> name ``foo``.
+                    elif rel.endswith("/__init__.py") and rel.count("/") == 1:
+                        sub_name = rel.split("/", 1)[0]
+                        symbol_to_source.setdefault(sub_name, fpath)
 
             if symbol_to_source:
                 init_reexport_map[init_path] = symbol_to_source
@@ -1819,7 +2023,148 @@ class IndexBuilderMixin:
                         self._file_symbol_imports[importer][source_file] = set()
                     self._file_symbol_imports[importer][source_file].add(sym)
 
+    def _augment_with_submodule_imports(
+        self,
+        suffix_to_path: dict[str, list[str]],
+    ) -> None:
+        """Track ``from pkg import submod`` as importing ``pkg/submod.py``.
+
+        The base import-resolution code maps ``from fastapi import routing`` to
+        ``fastapi/__init__.py`` (the package), with ``routing`` recorded as the
+        symbol. But the consumer is also effectively importing
+        ``fastapi/routing.py`` — the submodule file itself — and downstream
+        tools like ``get_file_context`` need that link to populate
+        ``imported_by`` correctly.
+
+        For every ``__init__.py`` target in ``_file_symbol_imports``, this pass
+        checks whether each imported symbol corresponds to a sibling ``.py`` /
+        ``__init__.py`` file in the same package directory. When it does, the
+        submodule file is added to all three indexes alongside the package.
+        """
+        additions: list[tuple[str, str, str]] = []  # (importer, submod_file, sym)
+        for importer, targets in list(self._file_symbol_imports.items()):
+            for target_file, sym_names in list(targets.items()):
+                if not target_file.endswith("/__init__.py"):
+                    continue
+                package_dir = target_file[: -len("/__init__.py")]
+                if not package_dir:
+                    continue
+                for sym in sym_names:
+                    for ext in (".py", "/__init__.py"):
+                        candidate = f"{package_dir}/{sym}{ext}"
+                        matches = suffix_to_path.get(candidate)
+                        if not matches:
+                            # Try shorter suffixes (in case package_dir is a long absolute path)
+                            parts = candidate.split("/")
+                            for start in range(1, len(parts)):
+                                short = "/".join(parts[start:])
+                                matches = suffix_to_path.get(short)
+                                if matches:
+                                    break
+                        if matches:
+                            submod = matches[0]
+                            if submod != target_file:
+                                additions.append((importer, submod, sym))
+                            break
+
+        for importer, submod, sym in additions:
+            if submod not in self._import_index:
+                self._import_index[submod] = []
+            if importer not in self._import_index[submod]:
+                self._import_index[submod].append(importer)
+            if importer not in self._forward_import_index:
+                self._forward_import_index[importer] = []
+            if submod not in self._forward_import_index[importer]:
+                self._forward_import_index[importer].append(submod)
+            if importer not in self._file_symbol_imports:
+                self._file_symbol_imports[importer] = {}
+            if submod not in self._file_symbol_imports[importer]:
+                self._file_symbol_imports[importer][submod] = set()
+            self._file_symbol_imports[importer][submod].add(sym)
+
     # --- Import Statement Parsing Helpers ---
+
+    @staticmethod
+    def _resolve_python_relative_import(
+        imp_str: str,
+        importer_path: str,
+        suffix_to_path: dict[str, list[str]],
+    ) -> str:
+        """Resolve a Python relative import to an absolute file path.
+
+        Handles 'from .module import X' (one dot = same package) and
+        'from ..module import X' (two dots = parent package). Uses the
+        suffix_to_path table (already built in Phase 1 of _build_import_index)
+        so no filesystem access is needed.
+
+        Returns the resolved absolute path, or '' if resolution fails.
+        """
+        if not imp_str.startswith("from ."):
+            return ""
+
+        # "from .database import get_db" -> mod_part = ".database"
+        rest = imp_str[5:]  # strip "from "
+        mod_part = rest.split(" import ")[0].strip()
+
+        # Count leading dots to determine how many levels to go up
+        dot_count = 0
+        while dot_count < len(mod_part) and mod_part[dot_count] == ".":
+            dot_count += 1
+        if dot_count == 0:
+            return ""
+
+        rel_module = mod_part[dot_count:]  # "database", "models", or "" for "from . import X"
+
+        # Resolve the base directory from the importer's path
+        importer_norm = importer_path.replace("\\", "/")
+        dir_parts = importer_norm.rsplit("/", 1)[0].split("/") if "/" in importer_norm else []
+
+        # Each extra dot means one level up (dot_count=1 → same dir, dot_count=2 → parent)
+        up = dot_count - 1
+        if up > 0:
+            if up > len(dir_parts):
+                return ""
+            dir_parts = dir_parts[:-up]
+        resolved_dir = "/".join(dir_parts)
+
+        # Build candidate path suffixes matching the suffix_to_path keys
+        if rel_module:
+            module_path = rel_module.replace(".", "/")
+            sep = "/" if resolved_dir else ""
+            candidates = [
+                f"{resolved_dir}{sep}{module_path}.py",
+                f"{resolved_dir}{sep}{module_path}/__init__.py",
+            ]
+        else:
+            sep = "/" if resolved_dir else ""
+            candidates = [f"{resolved_dir}{sep}__init__.py"]
+
+        for candidate in candidates:
+            # Try the full candidate as a suffix key first (O(1) lookup)
+            matches = suffix_to_path.get(candidate)
+            if not matches:
+                # Fall back to shorter suffixes (strip leading path components)
+                parts = candidate.split("/")
+                for start in range(1, len(parts)):
+                    short = "/".join(parts[start:])
+                    matches = suffix_to_path.get(short)
+                    if matches:
+                        break
+            if not matches:
+                continue
+            if len(matches) == 1:
+                return matches[0]
+            # Multiple matches: prefer the one sharing most directory components
+            resolved_parts = set(resolved_dir.split("/")) if resolved_dir else set()
+            best, best_score = matches[0], -1
+            for m in matches:
+                m_dir_parts = set(m.replace("\\", "/").rsplit("/", 1)[0].split("/"))
+                score = len(resolved_parts & m_dir_parts)
+                if score > best_score:
+                    best_score, best = score, m
+            return best
+
+        return ""
 
     @staticmethod
     def _extract_module_from_import(imp_str: str) -> str:

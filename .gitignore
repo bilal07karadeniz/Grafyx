@@ -24,6 +24,10 @@ audits/
 # added to git.
 docs/
 
+# Benchmarks — already-tracked scripts/configs stay tracked; new
+# benchmark output, repo clones, and intermediate artifacts ignored.
+benchmarks/
+
 # IDE
 .idea/
 .vscode/

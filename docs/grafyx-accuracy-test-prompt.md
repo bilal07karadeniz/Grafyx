@@ -29,6 +29,32 @@ You have access to Grafyx MCP tools. I need you to run a systematic accuracy aud
 | **1** | Broken / refuses to work / completely incorrect |
 | **N/A** | Test gate not applicable to this project (e.g., FastAPI test on a Django project) |
 
+## Known Limitations — Do NOT Grade These Down As Bugs
+
+Some patterns are *documented* architectural limits of static analysis,
+not regressions. If the audit hits one of these, mark the affected test
+**N/A** or call it out under "Known limitations encountered" rather than
+scoring 1–3.
+
+- **Decorator-on-instance dispatch** — `@router.get("/x")` is NOT
+  attributed as a caller of `APIRouter.get`. Resolving this would
+  require type-flow analysis. Same for `@app.delete`, `@router.patch`,
+  etc. Test 7/8/17 may surface this.
+- **Same-file function-level dependencies** — `get_dependency_graph`
+  reports *file-level* imports only. A function calling a sibling helper
+  in the same file does NOT appear in `depended_on_by`. Test 15.
+- **Celery `.delay()` / `.apply_async()`** — task dispatch through the
+  Celery registry is not detected. Test 17.
+- **Pipecat FrameProcessor methods** — `process_frame`, `push_frame`,
+  etc. show 0 callers due to dynamic pipeline dispatch. Test 16/17.
+- **TypeScript object-literal methods** — `const api = { fn: () => ... }`
+  may show 0 functions in skeleton/module counts (graph-sitter parser
+  limitation, partially worked around in v0.2.2 via Pass 8 but not
+  100%). Test 1/3/4.
+- **`from pkg import C` where `C` is a class re-exported via
+  `__init__.py`** — `imported_by` may undercount by 1–2 files vs.
+  direct grep for lazy-loader `__init__.py` patterns. Test 5.
+
 ---
 
 ## TEST 1: Project Skeleton
@@ -116,6 +142,12 @@ Pick a class that has subclasses. Call `get_class_context`, then call `get_subcl
 
 - Does `get_class_context` show the correct base classes?
 - Does `get_subclasses` find ALL subclasses?
+- **If the project has multiple classes with the same name** (e.g., two
+  `Base`, two `Config`, two `Manager`), call `get_subclasses` without
+  `file_path=` first — the response should set `ambiguous: true` and
+  list `candidates`. Then call again with `file_path=<one of them>` and
+  verify only the subclasses of THAT specific class are returned. (New
+  in v0.2.2; absence of disambiguation = bug.)
 - Rating: ?/5
 
 ## TEST 11: Search — Exact Match
@@ -126,9 +158,13 @@ Call `find_related_code` with a query that exactly matches a known function name
 - Is the score high (>0.7)?
 - Rating: ?/5
 
-## TEST 12: Search — Semantic/Conceptual ⭐ HEADLINE TEST FOR v0.2.0
+## TEST 12: Search — Semantic/Conceptual ⭐ HEADLINE SEARCH TEST
 
-**This test directly measures the new fastembed-backed semantic encoder shipped in v0.2.0.** The synthetic benchmark in `docs/benchmarks/0.2.0/` reported nDCG@10 = 0.787 on FastAPI + Django. If real-project queries score materially worse, that's a finding worth filing as a 0.2.1 bug.
+**This test directly measures the fastembed-backed semantic encoder
+(introduced in v0.2.0, hardened in v0.2.2).** The synthetic benchmark
+in `docs/benchmarks/0.2.0/` reported nDCG@10 = 0.787 on FastAPI +
+Django. If real-project queries score materially worse, that's a
+finding worth filing as a bug.
 
 Call `find_related_code` with a CONCEPTUAL query that doesn't match any symbol name exactly. Examples:
 
@@ -305,6 +341,22 @@ Then answer these questions:
 6. For caller/dependency tracking: what patterns were missed most? (DI? callbacks? dynamic dispatch? decorators?)
 7. Overall, if you had to pick ONE thing to fix that would help the most, what would it be?
 8. List every specific false positive and false negative you found, with the exact symbol name, file path, and why it was wrong.
-9. **v0.2.0 calibration:** the published synthetic benchmark in `docs/benchmarks/0.2.0/summary.md` reports nDCG@10 = 0.787 for the default `jina-v2` encoder. Compare your real-project semantic search quality (TEST 12). Does it match the synthetic benchmark roughly, or is it materially different? If different, why might that be — query style (terse vs docstring-like), codebase characteristics, encoder mismatch?
+9. **Search calibration:** the published synthetic benchmark in
+   `docs/benchmarks/0.2.0/summary.md` reports nDCG@10 = 0.787 for the
+   default `jina-v2` encoder. Compare your real-project semantic search
+   quality (TEST 12). Does it match the synthetic benchmark roughly, or
+   is it materially different? If different, why might that be — query
+   style (terse vs docstring-like), codebase characteristics, encoder
+   mismatch?
+10. **Known-limitations encountered:** which of the documented
+    limitations from the section at the top of this prompt did the
+    audit hit? List them so we can distinguish "static-analysis ceiling"
+    from "actual bug". Tests that surfaced one of these should be
+    excluded from the overall accuracy rating.
 
 Rate the overall Grafyx accuracy: ?/5
+
+(When computing the overall rating, **exclude tests that scored
+low purely due to documented limitations**. Score the rest. A repo that
+heavily uses one of the limitation patterns will have several N/A or
+excluded tests — that's expected.)
